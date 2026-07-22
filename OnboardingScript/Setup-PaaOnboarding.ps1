@@ -16,7 +16,21 @@
     subscriptions in the tenant.
 
 .PARAMETER IncludeLogAnalytics
-    If set, prompts for a Log Analytics workspace ID and includes it in the output block.
+    If set, prompts for a Log Analytics workspace ID. The workspace feeds BOTH the IAM Usage
+    Visualizer (AzureActivity table) AND R-671 app-permission right-sizing
+    (MicrosoftGraphActivityLogs table). The script automatically grants Log Analytics Reader
+    on the workspace to the Azure service principal so PAA can query it even when the workspace
+    lives in a subscription outside the scan scope. Use -EnableGraphActivityLogs to also turn
+    on the Entra log stream that fills the MicrosoftGraphActivityLogs table.
+
+.PARAMETER EnableGraphActivityLogs
+    If set together with -IncludeLogAnalytics, creates an Entra ID diagnostic setting
+    (PAA-GraphActivityLogs) that streams the MicrosoftGraphActivityLogs category to the
+    Log Analytics workspace. Requires Entra ID P1 or P2 licence (the category is rejected
+    without it); incurs Log Analytics ingestion cost (streams ALL tenant Graph API traffic);
+    data is forward-only — no backfill, so allow 30-90 days before R-671 app-permission
+    right-sizing data is meaningful. Has no effect without -IncludeLogAnalytics or if no
+    workspace ID is entered.
 
 .PARAMETER IncludeDefenderCspm
     If set, creates a separate Defender CSPM service principal with Security Reader on all
@@ -49,6 +63,9 @@ param (
     [switch]$IncludeLogAnalytics,
 
     [Parameter(Mandatory = $false)]
+    [switch]$EnableGraphActivityLogs,
+
+    [Parameter(Mandatory = $false)]
     [switch]$IncludeDefenderCspm,
 
     # Re-apply permissions/roles/registrations to EXISTING service principals only. Does NOT create
@@ -61,6 +78,13 @@ param (
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+# Bootstrap-secret lifetime (days). These client secrets are short-lived by design: PAA replaces each
+# with a self-rotating certificate on first connect (R-618/R-619) and discards the secret. The window
+# only needs to outlast the gap between running this script and the operator entering the credentials in
+# PAA. 30 days (was 7) gives comfortable slack so the credential doesn't die before the cert handoff,
+# while still expiring on its own if migration never happens.
+$bootstrapSecretDays = 30
 
 # ---------------------------------------------------------------------------
 # Helper functions
@@ -231,13 +255,16 @@ Connect-AzAccount -TenantId $TenantId | Out-Null
 # Discover subscriptions
 if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
     Write-Host "  Using $($SubscriptionIds.Count) specified subscription(s)..." -ForegroundColor Cyan
-    $subscriptions = $SubscriptionIds | ForEach-Object {
+    # @(...) forces array context so .Count is valid even for a single subscription (Set-StrictMode Latest)
+    $subscriptions = @($SubscriptionIds | ForEach-Object {
         Get-AzSubscription -SubscriptionId $_ -TenantId $TenantId
-    }
+    })
 } else {
     Write-Host "  Discovering all enabled subscriptions in tenant..." -ForegroundColor Cyan
-    $subscriptions = Get-AzSubscription -TenantId $TenantId |
-        Where-Object { $_.State -eq 'Enabled' }
+    # @(...) forces array context: a tenant with one enabled subscription returns a scalar (or $null
+    # when none match), and $subscriptions.Count below would otherwise throw under Set-StrictMode Latest.
+    $subscriptions = @(Get-AzSubscription -TenantId $TenantId |
+        Where-Object { $_.State -eq 'Enabled' })
 }
 
 if ($subscriptions.Count -eq 0) {
@@ -281,12 +308,26 @@ try {
         New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $costManagementReaderRoleId -Scope $scope -ErrorAction SilentlyContinue | Out-Null
     }
 
+    # Optional, read-only: enable the Zero Trust standing-access check (AZ-RBAC-009). It reads role
+    # assignments at the Azure ROOT scope '/' (above all subscriptions and management groups) to detect
+    # standing User Access Administrator / Owner granted via "elevate access". Reading '/' needs a role
+    # assignment AT '/', which a Global Admin can only grant after temporarily elevating access — so the
+    # script does NOT do it automatically. Skip it and the check simply reports "Manual review".
+    Write-Host ""
+    Write-Host "  Optional - Zero Trust 'no standing access to Azure' check (AZ-RBAC-009):" -ForegroundColor DarkCyan
+    Write-Host "    Reads role assignments at the Azure ROOT scope '/' (elevate-access detection)." -ForegroundColor Gray
+    Write-Host "    Read-only and optional - without it the check reports 'Manual review'; nothing else is affected." -ForegroundColor Gray
+    Write-Host "    To enable a real verdict, a Global Administrator runs (once):" -ForegroundColor Gray
+    Write-Host "      1. Entra admin center > Properties > 'Access management for Azure resources' = Yes (elevate)" -ForegroundColor Gray
+    Write-Host "      2. New-AzRoleAssignment -ObjectId $($azSp.Id) -RoleDefinitionId $readerRoleId -Scope '/'" -ForegroundColor Gray
+    Write-Host "      3. Set 'Access management for Azure resources' back to No (optional)" -ForegroundColor Gray
+
     $azAppId = $azSp.AppId
 
     # Bootstrap-only secret: PAA discards it after provisioning a self-rotating certificate (R-619).
-    # 7-day expiry — NOT a long-lived credential. Skipped in -PermissionsOnly (no new credentials).
+    # Short-lived ($bootstrapSecretDays-day) — NOT a long-lived credential. Skipped in -PermissionsOnly.
     if (-not $PermissionsOnly) {
-        $azSecretExpiry = (Get-Date).AddDays(7)
+        $azSecretExpiry = (Get-Date).AddDays($bootstrapSecretDays)
         $azSecret = New-AzADAppCredential -ApplicationId $azSp.AppId -StartDate (Get-Date) -EndDate $azSecretExpiry
         $azSecretText = $azSecret.SecretText
     }
@@ -339,6 +380,7 @@ $requiredGraphPermissions = @(
     'SecurityEvents.Read.All',               # Defender alerts + secure score + DfO beta policies
     'SecurityIncident.Read.All',             # Defender incidents (CollectIncidentSummaryAsync)
     'SharePointTenantSettings.Read.All',     # SharePoint / OneDrive admin settings
+    'NetworkAccess.Read.All',                # R-636: Global Secure Access / Entra Network config (config-only); degrades gracefully if absent / unlicensed
     'Application.ReadWrite.OwnedBy'          # R-618: self-scoped cert bootstrap/rotation (this app only)
 )
 
@@ -613,7 +655,7 @@ try {
     # Bootstrap-only secret: PAA discards it after generating the certificate (R-618).
     # Skipped in -PermissionsOnly (the app already has cert auth; no new credential needed).
     if (-not $PermissionsOnly) {
-        $m365SecretExpiry = (Get-Date).AddDays(7)
+        $m365SecretExpiry = (Get-Date).AddDays($bootstrapSecretDays)
         $m365SecretParams = @{
             ApplicationId      = $m365App.Id
             PasswordCredential = @{
@@ -643,20 +685,136 @@ try {
 # ---------------------------------------------------------------------------
 
 $logAnalyticsWorkspaceId = $null
+$workspaceArmId          = $null   # resolved ARM resource ID of the workspace
+$workspaceRoleGranted    = $false  # whether Log Analytics Reader was granted to $azSp
+$graphDiagSettingEnabled = $false  # whether MicrosoftGraphActivityLogs diag setting was created
 
 Write-Step "[4/5] Log Analytics configuration..."
 
 if ($IncludeLogAnalytics -and -not $PermissionsOnly) {
+    Write-Host "  The workspace feeds both the IAM Usage Visualizer (AzureActivity) and R-671" -ForegroundColor Cyan
+    Write-Host "  app-permission right-sizing (MicrosoftGraphActivityLogs). Use -EnableGraphActivityLogs" -ForegroundColor Cyan
+    Write-Host "  to also turn on the Entra log stream for MicrosoftGraphActivityLogs." -ForegroundColor Cyan
+    Write-Host ""
     Write-Host "  Enter your Log Analytics Workspace ID (from Azure portal > Log Analytics workspace > Overview):" -ForegroundColor Cyan
     $logAnalyticsWorkspaceId = Read-Host "  Workspace ID"
     if ([string]::IsNullOrWhiteSpace($logAnalyticsWorkspaceId)) {
         Write-Warn "  No workspace ID provided — Log Analytics will be skipped in output."
         $logAnalyticsWorkspaceId = $null
+    } elseif (-not [Guid]::TryParse($logAnalyticsWorkspaceId, [ref]([Guid]::Empty))) {
+        Write-Warn "  Workspace ID must be the GUID from the Log Analytics workspace Overview blade (form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx), not a resource path or name — skipping Log Analytics setup."
+        $logAnalyticsWorkspaceId = $null
     } else {
         Write-Success "  Log Analytics workspace ID recorded."
+
+        # ------------------------------------------------------------------
+        # 4a. Resolve workspace GUID → ARM resource ID via Azure Resource Graph
+        # ------------------------------------------------------------------
+        Write-Host "  Resolving workspace ARM resource ID via Resource Graph..." -ForegroundColor Cyan
+        try {
+            $rgQueryBody = [ordered]@{
+                query   = "resources | where type =~ 'microsoft.operationalinsights/workspaces' | where properties.customerId =~ '$logAnalyticsWorkspaceId' | project id, name, resourceGroup, subscriptionId"
+                options = [ordered]@{ resultFormat = 'objectArray' }
+            } | ConvertTo-Json -Depth 5
+
+            $rgResponse = Invoke-AzRestMethod -Path '/providers/Microsoft.ResourceGraph/resources?api-version=2021-03-01' -Method POST -Payload $rgQueryBody
+            if ($rgResponse.StatusCode -in 200, 201) {
+                $rgResult = $rgResponse.Content | ConvertFrom-Json
+                if ($rgResult.data -and @($rgResult.data).Count -gt 0) {
+                    $workspaceArmId = @($rgResult.data)[0].id
+                    Write-Host "  Workspace ARM ID : $workspaceArmId" -ForegroundColor Gray
+                } else {
+                    Write-Warn "  Could not resolve workspace '$logAnalyticsWorkspaceId' in Resource Graph — no matching workspace found. Check the ID and that you have Reader access to its subscription. Workspace role grant and diagnostic setting will be skipped."
+                }
+            } else {
+                Write-Warn "  Resource Graph query returned HTTP $($rgResponse.StatusCode) — could not resolve workspace ARM ID; skipping workspace role grant and diagnostic setting. Response: $($rgResponse.Content)"
+            }
+        } catch {
+            Write-Warn "  Resource Graph query failed: $($_.Exception.Message) — skipping workspace role grant and diagnostic setting."
+        }
+
+        # ------------------------------------------------------------------
+        # 4b. Assign Log Analytics Reader on the workspace to the Azure SP
+        # ------------------------------------------------------------------
+        if ($workspaceArmId) {
+            $laReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'  # Log Analytics Reader
+            if ($azSp) {
+                Write-Host "  Assigning Log Analytics Reader on workspace to $azSpName..." -ForegroundColor Cyan
+                try {
+                    New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $laReaderRoleId -Scope $workspaceArmId -ErrorAction SilentlyContinue | Out-Null
+                } catch {}
+                # Verify the assignment rather than assuming the silent call succeeded.
+                try {
+                    $verifiedAssignment = Get-AzRoleAssignment -ObjectId $azSp.Id -Scope $workspaceArmId -RoleDefinitionId $laReaderRoleId -ErrorAction SilentlyContinue
+                    if ($verifiedAssignment) {
+                        $workspaceRoleGranted = $true
+                        Write-Success "  Log Analytics Reader confirmed on workspace (allows PAA to query workspaces outside scan subscriptions)."
+                    } else {
+                        Write-Warn "  Log Analytics Reader role grant could not be confirmed — manual grant may be needed (or allow a few seconds for RBAC propagation and re-run)."
+                    }
+                } catch {
+                    Write-Warn "  Log Analytics Reader role verification failed: $($_.Exception.Message) — manual grant confirmation may be needed."
+                }
+            } else {
+                Write-Warn "  Azure service principal not available — skipping Log Analytics Reader grant on workspace."
+            }
+
+            # ------------------------------------------------------------------
+            # 4c. Optional: enable Entra MicrosoftGraphActivityLogs diagnostic setting
+            # ------------------------------------------------------------------
+            if ($EnableGraphActivityLogs) {
+                Write-Host ""
+                Write-Host "  +-[ MicrosoftGraphActivityLogs diagnostic setting ]----------------------------+" -ForegroundColor DarkYellow
+                Write-Host "  | This creates an Entra ID tenant-level diagnostic setting that streams ALL   |" -ForegroundColor DarkYellow
+                Write-Host "  | Graph API traffic (MicrosoftGraphActivityLogs) to your workspace.           |" -ForegroundColor DarkYellow
+                Write-Host "  |                                                                              |" -ForegroundColor DarkYellow
+                Write-Host "  | REQUIREMENTS:  Entra ID P1 or P2 licence (category rejected without it)    |" -ForegroundColor DarkYellow
+                Write-Host "  | COST:          Log Analytics ingestion cost — all tenant Graph API traffic  |" -ForegroundColor DarkYellow
+                Write-Host "  | FORWARD-ONLY:  No backfill. Allow 30-90 days before R-671 right-sizing     |" -ForegroundColor DarkYellow
+                Write-Host "  |                data is meaningful.                                          |" -ForegroundColor DarkYellow
+                Write-Host "  +------------------------------------------------------------------------------+" -ForegroundColor DarkYellow
+                Write-Host ""
+                $confirmDiag = Read-Host "  Enable Graph activity log stream? Type 'yes' to confirm (anything else skips)"
+                if ($confirmDiag -eq 'yes') {
+                    try {
+                        $diagSettingName = 'PAA-GraphActivityLogs'
+                        $diagPayload = [ordered]@{
+                            properties = [ordered]@{
+                                workspaceId = $workspaceArmId
+                                logs        = @(
+                                    [ordered]@{
+                                        category = 'MicrosoftGraphActivityLogs'
+                                        enabled  = $true
+                                    }
+                                )
+                            }
+                        } | ConvertTo-Json -Depth 5
+
+                        # api-version 2017-04-01-preview is the widely-supported version for
+                        # /providers/microsoft.aadiam/diagnosticSettings — there is no GA
+                        # equivalent for this endpoint; the preview designation is permanent.
+                        $diagPath = "/providers/microsoft.aadiam/diagnosticSettings/${diagSettingName}?api-version=2017-04-01-preview"
+                        $diagResponse = Invoke-AzRestMethod -Path $diagPath -Method PUT -Payload $diagPayload
+                        if ($diagResponse.StatusCode -in 200, 201) {
+                            $graphDiagSettingEnabled = $true
+                            Write-Success "  Graph activity logging enabled → workspace; data will begin flowing (forward-only)."
+                        } else {
+                            Write-Warn "  Entra diagnostic setting PUT returned HTTP $($diagResponse.StatusCode). Common causes: missing Entra P1/P2 (category rejected by the service) or insufficient rights (Security Administrator / Global Administrator required). Response: $($diagResponse.Content)"
+                            $consentFailures += "Entra diagnostic setting 'PAA-GraphActivityLogs' (MicrosoftGraphActivityLogs → workspace) — HTTP $($diagResponse.StatusCode)"
+                        }
+                    } catch {
+                        Write-Warn "  Entra diagnostic setting creation failed: $($_.Exception.Message). Common causes: missing Entra P1/P2 licence or insufficient Entra admin rights."
+                        $consentFailures += "Entra diagnostic setting 'PAA-GraphActivityLogs' (MicrosoftGraphActivityLogs → workspace) — $($_.Exception.Message)"
+                    }
+                } else {
+                    Write-Host "  Graph activity log stream skipped (not confirmed)." -ForegroundColor Gray
+                }
+            }
+        }
     }
 } else {
     Write-Host "  Skipped (use -IncludeLogAnalytics to configure)." -ForegroundColor Gray
+    Write-Host "  Note: -PermissionsOnly also suppresses this step — to (re)grant the workspace role, re-run without -PermissionsOnly." -ForegroundColor Gray
 }
 
 # ---------------------------------------------------------------------------
@@ -695,9 +853,9 @@ if ($IncludeDefenderCspm) {
         $defenderAppId = $defenderSp.AppId
 
         # Bootstrap-only secret: PAA discards it after provisioning a self-rotating certificate (R-619).
-        # 7-day expiry — NOT a long-lived credential. Skipped in -PermissionsOnly.
+        # Short-lived ($bootstrapSecretDays-day) — NOT a long-lived credential. Skipped in -PermissionsOnly.
         if (-not $PermissionsOnly) {
-            $defenderSecretExpiry = (Get-Date).AddDays(7)
+            $defenderSecretExpiry = (Get-Date).AddDays($bootstrapSecretDays)
             $defenderSecret = New-AzADAppCredential -ApplicationId $defenderSp.AppId -StartDate (Get-Date) -EndDate $defenderSecretExpiry
             $defenderSecretText = $defenderSecret.SecretText
         }
@@ -790,6 +948,13 @@ $credLines += ""
 if ($logAnalyticsWorkspaceId) {
     $credLines += "# -- Log Analytics --"
     $credLines += "LOG_ANALYTICS_WORKSPACE_ID=$logAnalyticsWorkspaceId"
+    if ($workspaceArmId) {
+        $credLines += "# Workspace ARM ID     : $workspaceArmId"
+        $credLines += "# Log Analytics Reader : $(if ($workspaceRoleGranted) { 'Granted to Azure SP' } else { 'Not granted (see warnings above)' })"
+        $credLines += "# Graph activity logs  : $(if ($graphDiagSettingEnabled) { 'Enabled (PAA-GraphActivityLogs diagnostic setting created)' } else { 'Not enabled' })"
+    } else {
+        $credLines += "# Workspace ARM ID     : Could not be resolved — Log Analytics Reader was not granted"
+    }
     $credLines += ""
 }
 
@@ -836,7 +1001,7 @@ $credLines += "#   above, register it manually in Windows PowerShell 5.1 as a PP
 $credLines += "#     New-PowerAppManagementApp -ApplicationId $m365AppId"
 $credLines += "#   Without it the BAP admin API returns 403 and PP checks stay ManualReview."
 $credLines += "# NOTE: ALL client secrets below (Azure, M365$(if ($IncludeDefenderCspm) { ', Defender' })) are bootstrap-only"
-$credLines += "#       (7-day expiry) and are discarded by PAA after it provisions a"
+$credLines += "#       ($bootstrapSecretDays-day expiry) and are discarded by PAA after it provisions a"
 $credLines += "#       self-rotating certificate on each service principal."
 
 if ($IncludeDefenderCspm) {
@@ -886,6 +1051,13 @@ if ($logAnalyticsWorkspaceId) {
     Write-Host ""
     Write-Host "  Log Analytics" -ForegroundColor Cyan
     Write-Host "    Workspace ID         : $logAnalyticsWorkspaceId"
+    if ($workspaceArmId) {
+        Write-Host "    Workspace ARM ID     : $workspaceArmId" -ForegroundColor Gray
+        Write-Host "    Log Analytics Reader : $(if ($workspaceRoleGranted) { 'Granted to Azure SP' } else { 'Not granted (see warnings above)' })" -ForegroundColor $(if ($workspaceRoleGranted) { 'Green' } else { 'DarkYellow' })
+        Write-Host "    Graph activity logs  : $(if ($graphDiagSettingEnabled) { 'Enabled (PAA-GraphActivityLogs)' } else { 'Not enabled' })" -ForegroundColor $(if ($graphDiagSettingEnabled) { 'Green' } else { 'Gray' })
+    } else {
+        Write-Host "    Workspace ARM ID     : Could not be resolved — Log Analytics Reader was not granted" -ForegroundColor DarkYellow
+    }
 }
 
 if ($IncludeDefenderCspm -and $defenderAppId) {
@@ -900,7 +1072,7 @@ Write-Host ""
 Write-Host "================================================================" -ForegroundColor Green
 Write-Host ""
 Write-Host "  Full secrets are written to the credentials file only." -ForegroundColor DarkYellow
-Write-Host "  All secrets are bootstrap-only (7-day expiry) — PAA replaces each with a" -ForegroundColor DarkYellow
+Write-Host "  All secrets are bootstrap-only ($bootstrapSecretDays-day expiry) — PAA replaces each with a" -ForegroundColor DarkYellow
 Write-Host "  self-rotating certificate and discards the secret (R-619)." -ForegroundColor DarkYellow
 Write-Host ""
 

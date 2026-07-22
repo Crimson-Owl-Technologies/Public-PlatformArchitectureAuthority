@@ -40,11 +40,19 @@ Install-Module -Name Az.Accounts, Az.Resources, Microsoft.Graph -Scope CurrentUs
     -SubscriptionIds @("11111111-aaaa-bbbb-cccc-000000000001", "22222222-aaaa-bbbb-cccc-000000000002")
 ```
 
-**With Log Analytics workspace (prompts for workspace ID):**
+**With Log Analytics workspace (prompts for workspace ID; also grants Log Analytics Reader on the workspace to the Azure SP):**
 
 ```powershell
 .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
     -IncludeLogAnalytics
+```
+
+**With Log Analytics workspace and Entra Graph activity log stream (R-671 app-permission right-sizing):**
+
+```powershell
+.\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
+    -IncludeLogAnalytics `
+    -EnableGraphActivityLogs
 ```
 
 **Full setup including Defender CSPM:**
@@ -52,6 +60,7 @@ Install-Module -Name Az.Accounts, Az.Resources, Microsoft.Graph -Scope CurrentUs
 ```powershell
 .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
     -IncludeLogAnalytics `
+    -EnableGraphActivityLogs `
     -IncludeDefenderCspm
 ```
 
@@ -114,6 +123,33 @@ The CIS Section 9 (Power BI / Fabric) checks need **`Tenant.Read.All`** granted 
 
 ### Credentials file
 `paa-credentials-<tenant prefix>.txt` in the scripts folder, restricted to your Windows user account only. It contains **bootstrap secrets (7-day expiry)** — delete it after you have pasted the values into PAA.
+
+### (Optional) Log Analytics workspace
+
+When `-IncludeLogAnalytics` is set, the script:
+
+1. Prompts for the **Log Analytics Workspace ID** (GUID from Azure portal > Log Analytics workspace > Overview).
+2. Resolves the workspace's **ARM resource ID** via Azure Resource Graph.
+3. Assigns **Log Analytics Reader** (`73c42c96-874c-492b-b04d-ab87d138a893`) on the workspace to the Azure service principal — so PAA can query the workspace even if it lives in a subscription not covered by the scan scope.
+
+One workspace serves both features:
+
+| Table | Feature |
+|-------|---------|
+| `AzureActivity` | IAM Usage Visualizer |
+| `MicrosoftGraphActivityLogs` | R-671 App-Permission Right-Sizing |
+
+#### `-EnableGraphActivityLogs` — Entra Graph activity log stream
+
+Add `-EnableGraphActivityLogs` (together with `-IncludeLogAnalytics`) to also create an Entra ID diagnostic setting (`PAA-GraphActivityLogs`) that streams the `MicrosoftGraphActivityLogs` category to the workspace. The script shows a confirmation prompt before applying it because:
+
+- **Requires Entra ID P1 or P2 licence** — the category is rejected by the Entra service without it.
+- **Incurs Log Analytics ingestion cost** — it streams ALL tenant Graph API traffic continuously.
+- **Forward-only** — there is no backfill. Data starts accumulating from the moment the setting is created. Allow **30-90 days** before the R-671 app-permission right-sizing recommendations become meaningful.
+
+The setting uses the stable name `PAA-GraphActivityLogs`, so re-running the script with `-EnableGraphActivityLogs` is idempotent (it updates rather than duplicates).
+
+If the workspace ARM ID cannot be resolved (bad GUID, or the admin running the script does not have Reader access to the workspace's subscription), the role grant and diagnostic setting are skipped with a warning, but the workspace ID is still recorded in the credentials file.
 
 ### (Optional) Defender CSPM service principal
 Named `PAA-Defender-<first 8 chars of tenant ID>`, assigned **Security Reader** on all subscriptions, with the same self-rotating-certificate model as the Azure principal.
