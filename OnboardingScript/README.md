@@ -8,7 +8,9 @@ Automates the PAA tenant onboarding that would otherwise require several manual 
 - an **M365 (Microsoft Graph) app registration** with the application permissions PAA needs,
 - and, optionally, a **Defender CSPM service principal** and a Log Analytics workspace reference.
 
-Each principal is created with a short-lived **bootstrap secret only**. After you connect it, PAA provisions a **self-rotating certificate** in its own Key Vault and discards the bootstrap secret — so there is no long-lived credential to manage or rotate (R-618 / R-619). At the end the script writes the bootstrap credentials to a locked `.txt` file in the same folder, ready to paste into PAA.
+Each principal is created with a short-lived **bootstrap secret only** (30-day expiry). After you connect it, PAA provisions a **self-rotating certificate** in its own Key Vault and discards the bootstrap secret — so there is no long-lived credential to manage or rotate (R-618 / R-619). At the end the script writes the bootstrap credentials to a locked `.txt` file in the same folder, ready to paste into PAA.
+
+> **If Microsoft 365 is out of scope**, pass `-AzureOnly`. No M365 app registration is created and no Graph, Exchange, SharePoint, Power BI, Global Reader or Power Platform permission is requested. See [Azure-only onboarding](#azure-only-onboarding--azureonly) — read it before running against a customer whose security review restricted the scope.
 
 ## Prerequisites
 
@@ -31,6 +33,12 @@ Install-Module -Name Az.Accounts, Az.Resources, Microsoft.Graph -Scope CurrentUs
 
 ```powershell
 .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+```
+
+**Azure only — no Microsoft 365, Entra ID, SharePoint, Exchange or Power Platform access:**
+
+```powershell
+.\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -AzureOnly
 ```
 
 **Specific subscription IDs (skip auto-discovery):**
@@ -102,9 +110,13 @@ Named `PAA-M365-<first 8 chars of tenant ID>`, with the following Graph **applic
 - `AuditLog.Read.All` — sign-in activity on guest users
 - `Reports.Read.All` — assigned-but-inactive M365 licence detection (optional; degrades gracefully if absent)
 - `DeviceManagementManagedDevices.Read.All`, `DeviceManagementConfiguration.Read.All`, `DeviceManagementApps.Read.All` — Intune device compliance, configuration, and app-protection
+- `DeviceManagementServiceConfig.Read.All` — enrollment restrictions, mobile-threat-defence connectors, Autopilot profiles (R-753)
+- `DeviceManagementRBAC.Read.All` — Intune operation-approval policies (R-753)
+- `OnPremDirectorySynchronization.Read.All` — Entra Connect sync configuration and state (R-753)
 - `SecurityEvents.Read.All` — Defender alerts, Secure Score, and Defender for Office 365 policies
 - `SecurityIncident.Read.All` — Defender incidents
 - `SharePointTenantSettings.Read.All` — SharePoint / OneDrive admin settings
+- `NetworkAccess.Read.All` — Global Secure Access / Entra Network configuration (R-636); degrades gracefully if absent or unlicensed
 - `Application.ReadWrite.OwnedBy` — self-scoped certificate bootstrap/rotation (this app only)
 
 Plus:
@@ -122,7 +134,7 @@ The Power Platform checks (SCUBA-PP-1.1/1.2/2.1/4.1, MT.1099/1100/1101) read ten
 The CIS Section 9 (Power BI / Fabric) checks need **`Tenant.Read.All`** granted to the M365 app **in the Power BI admin portal** (Admin API settings → service-principal access). This is a Power BI service permission, not a Graph app role, so the script cannot grant it — do it manually if you want those checks. They are skipped gracefully if it is absent.
 
 ### Credentials file
-`paa-credentials-<tenant prefix>.txt` in the scripts folder, restricted to your Windows user account only. It contains **bootstrap secrets (7-day expiry)** — delete it after you have pasted the values into PAA.
+`paa-credentials-<tenant prefix>.txt` in the scripts folder, restricted to your Windows user account only. It contains **bootstrap secrets (30-day expiry)** — delete it after you have pasted the values into PAA. Under `-AzureOnly` the file carries no M365 values and says so explicitly.
 
 ### (Optional) Log Analytics workspace
 
@@ -151,6 +163,28 @@ The setting uses the stable name `PAA-GraphActivityLogs`, so re-running the scri
 
 If the workspace ARM ID cannot be resolved (bad GUID, or the admin running the script does not have Reader access to the workspace's subscription), the role grant and diagnostic setting are skipped with a warning, but the workspace ID is still recorded in the credentials file.
 
+## Azure-only onboarding (`-AzureOnly`)
+
+For customers whose security review permits reading Azure configuration but not Microsoft 365 or directory data. Pass `-AzureOnly` and the script creates **only** the Azure service principal.
+
+**What is still granted:** Reader, Security Reader and Cost Management Reader on each in-scope subscription, plus the self-scoped `Application.ReadWrite.OwnedBy` grant and self-ownership the principal needs to rotate its own certificate. The certificate bootstrap runs on this path too — the principal does *not* get left on an expiring bootstrap secret.
+
+**What is not created, requested, consented or assigned:**
+
+- The `PAA-M365-*` app registration and service principal
+- Every Microsoft Graph application permission listed above
+- `Exchange.ManageAsApp`, `Sites.FullControl.All`, Power BI `Tenant.Read.All`
+- The **Global Reader** directory role
+- The Power Platform management-application registration
+
+The operator's own consent prompt is narrowed to match: `RoleManagement.ReadWrite.Directory` is only requested when the Global Reader assignment will actually happen, so an Azure-only run asks the admin for `Application.ReadWrite.All` and `AppRoleAssignment.ReadWrite.All` only.
+
+**Consequence:** Microsoft 365, Entra ID and Zero Trust checks report as **not evaluated**. Only the Azure infrastructure checks run. Extending an Azure-only tenant to Microsoft 365 later means a separate run without `-AzureOnly`, and a fresh admin consent — which for a customer under a scoped exception is a new approval, not a re-run.
+
+The credentials file and terminal output both state plainly that M365 was not onboarded, so the customer's own record of what was granted matches reality.
+
+> **Polarity note.** `Setup-PaaLocalScan.ps1` opts *in* to Microsoft 365 with `-IncludeM365`; this script opts *out* with `-AzureOnly`. The inversion is deliberate — hosted onboarding has always granted M365 by default, and silently dropping it would change what an existing re-run does. Check which script you are holding before assuming the default.
+
 ### (Optional) Defender CSPM service principal
 Named `PAA-Defender-<first 8 chars of tenant ID>`, assigned **Security Reader** on all subscriptions, with the same self-rotating-certificate model as the Azure principal.
 
@@ -159,7 +193,7 @@ Named `PAA-Defender-<first 8 chars of tenant ID>`, assigned **Security Reader** 
 1. Open the credentials file (`paa-credentials-<tenant prefix>.txt`) in the scripts folder.
 2. In PAA, go to **Settings > Integrations**.
 3. Under **Azure**, paste `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_IDS`.
-4. Under **Microsoft 365**, paste `M365_CLIENT_ID`, `M365_CLIENT_SECRET`, and `M365_TENANT_ID`.
+4. Under **Microsoft 365**, paste `M365_CLIENT_ID`, `M365_CLIENT_SECRET`, and `M365_TENANT_ID`. *(Skip this on an `-AzureOnly` run — leave the section empty.)*
 5. *(Optional)* For Power BI / Fabric checks, grant `Tenant.Read.All` to the M365 app in the Power BI admin portal (see above).
 6. If you added Log Analytics, paste `LOG_ANALYTICS_WORKSPACE_ID` in the Log Analytics section.
 7. If you added Defender CSPM, paste `DEFENDER_CLIENT_ID` and `DEFENDER_CLIENT_SECRET` in the Defender section.
@@ -184,4 +218,4 @@ PAA cannot collect M365 data for any permission that has not been consented.
 
 ## Re-running the script
 
-The script is idempotent. If `PAA-Azure-<tenant prefix>`, `PAA-M365-<tenant prefix>`, or `PAA-Defender-<tenant prefix>` already exist in Entra ID, they are reused rather than recreated, and existing role assignments/consents are left in place. A fresh **bootstrap** secret (7-day expiry) is issued on each run; because PAA rotates each principal onto its own certificate after connection, these bootstrap secrets are disposable — you do not need to track or clean them up beyond deleting the credentials file.
+The script is idempotent. If `PAA-Azure-<tenant prefix>`, `PAA-M365-<tenant prefix>`, or `PAA-Defender-<tenant prefix>` already exist in Entra ID, they are reused rather than recreated, and existing role assignments/consents are left in place. A fresh **bootstrap** secret (30-day expiry) is issued on each run; because PAA rotates each principal onto its own certificate after connection, these bootstrap secrets are disposable — you do not need to track or clean them up beyond deleting the credentials file.

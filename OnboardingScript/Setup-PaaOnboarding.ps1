@@ -36,8 +36,26 @@
     If set, creates a separate Defender CSPM service principal with Security Reader on all
     subscriptions.
 
+.PARAMETER AzureOnly
+    If set, onboards Azure ONLY: no M365 Graph app registration is created, no Graph application
+    permission is requested, no Exchange.ManageAsApp / Sites.FullControl.All / Power BI
+    Tenant.Read.All app role is consented, the Global Reader directory role is not assigned, and
+    the Power Platform management application is not registered. The Azure service principal still
+    receives its three read-only Azure roles and the self-scoped Application.ReadWrite.OwnedBy
+    grant it needs for certificate rotation (R-619).
+
+    For customers whose security review permits Azure configuration reading but not Microsoft 365
+    or directory access. M365, Entra ID and Zero Trust checks report as not evaluated. Mirrors the
+    choice Setup-PaaLocalScan.ps1 offers via -IncludeM365 — note the polarity is inverted: local
+    scan opts IN to M365, this script opts OUT, so that the existing default behaviour of hosted
+    onboarding is unchanged.
+
 .EXAMPLE
     .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+.EXAMPLE
+    # Azure only — no Microsoft 365, Entra ID, SharePoint, Exchange or Power Platform access:
+    .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -AzureOnly
 
 .EXAMPLE
     .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -67,6 +85,10 @@ param (
 
     [Parameter(Mandatory = $false)]
     [switch]$IncludeDefenderCspm,
+
+    # Azure-only onboarding: skip the M365 Graph app registration entirely. See .PARAMETER AzureOnly.
+    [Parameter(Mandatory = $false)]
+    [switch]$AzureOnly,
 
     # Re-apply permissions/roles/registrations to EXISTING service principals only. Does NOT create
     # apps/SPs and does NOT generate any secret or credentials file. Use to grant newly-added
@@ -126,6 +148,127 @@ function Wait-SpPropagation {
         Start-Sleep -Seconds $DelaySec
     }
     throw "SP $ObjectId did not propagate within $($MaxRetries * $DelaySec)s"
+}
+
+<#
+.SYNOPSIS
+    Whether the SIGNED-IN OPERATOR can create role assignments at a subscription scope.
+.DESCRIPTION
+    R-749, ported from Setup-PaaLocalScan.ps1 (R-748). Creating a role assignment needs Owner, User
+    Access Administrator, or Role Based Access Control Administrator at the scope. The permissions API
+    answers that read-only, in one call, BEFORE anything is created — so an onboarding run can say
+    which subscriptions it will not be able to grant on instead of discovering it silently, one failed
+    assignment at a time.
+
+    Returns $true, $false, or $null when the probe itself could not run (treated as "attempt anyway").
+#>
+function Test-CanAssignRoles {
+    param([string]$SubscriptionId)
+
+    $uri = "https://management.azure.com/subscriptions/$SubscriptionId/providers/" +
+           "Microsoft.Authorization/permissions?api-version=2022-04-01"
+
+    try {
+        $response = Invoke-AzRestMethod -Method GET -Uri $uri -ErrorAction Stop
+        if ($response.StatusCode -ne 200) { return $null }
+
+        foreach ($p in ($response.Content | ConvertFrom-Json).value) {
+            foreach ($action in @($p.actions)) {
+                if ($action -in @('*', 'Microsoft.Authorization/*',
+                                  'Microsoft.Authorization/roleAssignments/*',
+                                  'Microsoft.Authorization/roleAssignments/write')) {
+                    $denied = @($p.notActions) | Where-Object {
+                        $_ -in @('Microsoft.Authorization/roleAssignments/write',
+                                 'Microsoft.Authorization/roleAssignments/*',
+                                 'Microsoft.Authorization/*')
+                    }
+                    if (-not $denied) { return $true }
+                }
+            }
+        }
+        return $false
+    } catch {
+        return $null
+    }
+}
+
+<#
+.SYNOPSIS
+    Assigns an Azure role and CONFIRMS it, returning what actually happened.
+.DESCRIPTION
+    ⚠ R-749. Every New-AzRoleAssignment in this script used to be `-ErrorAction SilentlyContinue` with
+    no check of the result. On a subscription where the operator lacks
+    Microsoft.Authorization/roleAssignments/write — which R-748 proved is an ordinary situation, not an
+    exotic one — that printed "Assigning Reader on <sub>...", granted nothing, and went on to report
+    "Azure service principal ready". Onboarding completed successfully, having produced a scanning
+    identity that could not read the subscription.
+
+    The failure is silent at provisioning time and only surfaces later, in a scan — and before
+    R-736/R-738 it would not have surfaced there either: an unreadable subscription returned zero
+    resources and scored as a clean estate.
+
+    The lesson was already in this file. The Log Analytics workspace grant verifies its own assignment,
+    with the comment "Verify the assignment rather than assuming the silent call succeeded". It was
+    learned once, in one place, and never applied to the main loop.
+
+    ⚠ Deliberately never throws. Aborting onboarding for customers where it currently half-works would
+    be a regression in behaviour even though it is an improvement in honesty — the caller reports the
+    failures and continues.
+.OUTPUTS
+    A PSCustomObject: Subscription, Role, Outcome ('AlreadyAssigned'|'Granted'|'Failed'), Reason.
+#>
+function Grant-AzureRoleVerified {
+    param(
+        [string]$ObjectId,
+        [string]$RoleDefinitionId,
+        [string]$RoleName,
+        [string]$Scope,
+        [string]$SubscriptionName,
+        [int]$VerifyRetries = 5,
+        [int]$VerifyDelaySec = 3
+    )
+
+    $result = [pscustomobject]@{
+        Subscription = $SubscriptionName
+        Role         = $RoleName
+        Outcome      = 'Failed'
+        Reason       = $null
+    }
+
+    $existing = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionId $RoleDefinitionId `
+        -Scope $Scope -ErrorAction SilentlyContinue
+    if ($existing) {
+        $result.Outcome = 'AlreadyAssigned'
+        return $result
+    }
+
+    try {
+        New-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionId $RoleDefinitionId `
+            -Scope $Scope -ErrorAction Stop | Out-Null
+    } catch {
+        # An already-existing assignment also throws; the read-back below settles which it was.
+        $result.Reason = $_.Exception.Message.Split([char]10)[0]
+    }
+
+    # Verify, with a short poll. RBAC is eventually consistent — this file's own Log Analytics block
+    # says "allow a few seconds for RBAC propagation". ⚠ R-758's lesson applies: a verification that
+    # can produce a false negative must not drive anything destructive. Nothing here is destructive —
+    # a failed confirmation is reported, never acted upon.
+    for ($i = 0; $i -lt $VerifyRetries; $i++) {
+        $confirmed = Get-AzRoleAssignment -ObjectId $ObjectId -RoleDefinitionId $RoleDefinitionId `
+            -Scope $Scope -ErrorAction SilentlyContinue
+        if ($confirmed) {
+            $result.Outcome = 'Granted'
+            $result.Reason = $null
+            return $result
+        }
+        Start-Sleep -Seconds $VerifyDelaySec
+    }
+
+    if (-not $result.Reason) {
+        $result.Reason = 'the call reported no error but the assignment is not readable afterwards'
+    }
+    return $result
 }
 
 # R-619 — turns an Az-created service principal into a self-managing Graph app:
@@ -297,15 +440,56 @@ try {
         Wait-SpPropagation -ObjectId $azSp.Id
     }
 
-    # Assign Reader + Security Reader on each subscription
+    # R-749: preflight, then assign and CONFIRM. See Grant-AzureRoleVerified for why the previous
+    # -ErrorAction SilentlyContinue with no result check produced onboardings that reported success
+    # while granting nothing.
+    $roleResults = @()
+    $azRoles = @(
+        @{ Id = $readerRoleId;               Name = 'Reader' }
+        @{ Id = $securityReaderRoleId;       Name = 'Security Reader' }
+        @{ Id = $costManagementReaderRoleId; Name = 'Cost Management Reader' }
+    )
+
     foreach ($sub in $subscriptions) {
         $scope = "/subscriptions/$($sub.Id)"
-        Write-Host "    Assigning Reader on $($sub.Name)..." -ForegroundColor Gray
-        New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $readerRoleId -Scope $scope -ErrorAction SilentlyContinue | Out-Null
-        Write-Host "    Assigning Security Reader on $($sub.Name)..." -ForegroundColor Gray
-        New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $securityReaderRoleId -Scope $scope -ErrorAction SilentlyContinue | Out-Null
-        Write-Host "    Assigning Cost Management Reader on $($sub.Name)..." -ForegroundColor Gray
-        New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $costManagementReaderRoleId -Scope $scope -ErrorAction SilentlyContinue | Out-Null
+
+        if ((Test-CanAssignRoles -SubscriptionId $sub.Id) -eq $false) {
+            # Stated once per subscription rather than three times as three identical failures.
+            Write-Warn "    $($sub.Name): you cannot create role assignments here — skipping its $($azRoles.Count) roles."
+            foreach ($role in $azRoles) {
+                $roleResults += [pscustomobject]@{
+                    Subscription = $sub.Name; Role = $role.Name; Outcome = 'Failed'
+                    Reason = 'the signed-in operator has no Microsoft.Authorization/roleAssignments/write at this scope'
+                }
+            }
+            continue
+        }
+
+        foreach ($role in $azRoles) {
+            Write-Host "    Assigning $($role.Name) on $($sub.Name)..." -ForegroundColor Gray
+            $roleResults += Grant-AzureRoleVerified -ObjectId $azSp.Id -RoleDefinitionId $role.Id `
+                -RoleName $role.Name -Scope $scope -SubscriptionName $sub.Name
+        }
+    }
+
+    $failedRoles = @($roleResults | Where-Object { $_.Outcome -eq 'Failed' })
+    $confirmed = @($roleResults | Where-Object { $_.Outcome -in @('Granted', 'AlreadyAssigned') })
+
+    Write-Host "    $($confirmed.Count) of $($roleResults.Count) role assignment(s) confirmed." -ForegroundColor Gray
+
+    if ($failedRoles.Count -gt 0) {
+        Write-Host ""
+        Write-Warn "  $($failedRoles.Count) role assignment(s) could NOT be confirmed:"
+        foreach ($f in $failedRoles) {
+            Write-Warn "    - $($f.Subscription): $($f.Role) — $($f.Reason)"
+        }
+        Write-Host ""
+        Write-Host "  Onboarding continues, and this is not fatal — but PAA will not be able to read" -ForegroundColor DarkCyan
+        Write-Host "  those subscriptions. Its scans will report them as blind spots rather than as" -ForegroundColor DarkCyan
+        Write-Host "  clean, so the gap is visible in the product; it is not visible to the customer" -ForegroundColor DarkCyan
+        Write-Host "  unless someone acts on it. Creating a role assignment needs Owner, User Access" -ForegroundColor DarkCyan
+        Write-Host "  Administrator, or Role Based Access Control Administrator at the subscription." -ForegroundColor DarkCyan
+        Write-Host ""
     }
 
     # Optional, read-only: enable the Zero Trust standing-access check (AZ-RBAC-009). It reads role
@@ -341,10 +525,15 @@ try {
 }
 
 # ---------------------------------------------------------------------------
-# Step 3 — M365 Graph app registration
+# Step 3 — Graph session, Azure SP certificate bootstrap, and (unless -AzureOnly)
+#          the M365 Graph app registration
 # ---------------------------------------------------------------------------
 
-Write-Step "[3/5] Creating M365 Graph app registration..."
+if ($AzureOnly) {
+    Write-Step "[3/5] Azure-only: certificate bootstrap (no M365 app registration)..."
+} else {
+    Write-Step "[3/5] Creating M365 Graph app registration..."
+}
 
 Write-Host "  Connecting to Microsoft Graph (tenant: $TenantId)..." -ForegroundColor Cyan
 # Scopes needed:
@@ -353,36 +542,11 @@ Write-Host "  Connecting to Microsoft Graph (tenant: $TenantId)..." -ForegroundC
 #  - RoleManagement.ReadWrite.Directory: assign the Global Reader directory role
 # Without AppRoleAssignment.ReadWrite.All every permission grant returns 403
 # Authorization_RequestDenied. Re-running triggers a one-time consent prompt for these scopes.
-Connect-MgGraph -TenantId $TenantId -Scopes 'Application.ReadWrite.All','AppRoleAssignment.ReadWrite.All','RoleManagement.ReadWrite.Directory' | Out-Null
-
-# Stable app name based on tenant ID — idempotent across runs
-$m365AppName = "PAA-M365-$($TenantId.Substring(0, 8))"
-
-# Required Graph application permissions (type = Role). Least-privilege set, cross-checked
-# against actual collector/ZeroTrust endpoint usage. All read-only EXCEPT
-# Application.ReadWrite.OwnedBy, which is self-scoped (manages only this app's own credential,
-# per R-618). Directory.Read.All is the umbrella for directory-object reads (applications,
-# servicePrincipals, organization, groups, users, directoryRoles, domains) — narrower roles it
-# already covers (Application.Read.All / Organization.Read.All / Group.Read.All) are NOT granted.
-$requiredGraphPermissions = @(
-    'Directory.Read.All',                    # Directory objects: roles, users, SPs, apps, groups, org, domains
-    'Policy.Read.All',                       # CA / auth-method / authorization / cross-tenant-access / app-mgmt policies
-    'RoleManagement.Read.Directory',         # PIM schedules + role management policies
-    'AccessReview.Read.All',                 # Access review definitions/instances (P2)
-    'DelegatedAdminRelationship.Read.All',   # GDAP partner relationships
-    'DelegatedPermissionGrant.Read.All',     # OAuth2 delegated grants (oauth2PermissionGrants)
-    'IdentityRiskyUser.Read.All',            # Identity Protection risky users (P2)
-    'AuditLog.Read.All',                     # signInActivity on guest users
-    'Reports.Read.All',                      # assigned-but-inactive M365 license detection (R-610); degrades gracefully if absent
-    'DeviceManagementManagedDevices.Read.All',
-    'DeviceManagementConfiguration.Read.All',
-    'DeviceManagementApps.Read.All',
-    'SecurityEvents.Read.All',               # Defender alerts + secure score + DfO beta policies
-    'SecurityIncident.Read.All',             # Defender incidents (CollectIncidentSummaryAsync)
-    'SharePointTenantSettings.Read.All',     # SharePoint / OneDrive admin settings
-    'NetworkAccess.Read.All',                # R-636: Global Secure Access / Entra Network config (config-only); degrades gracefully if absent / unlicensed
-    'Application.ReadWrite.OwnedBy'          # R-618: self-scoped cert bootstrap/rotation (this app only)
-)
+# Under -AzureOnly the Global Reader role is never assigned, so RoleManagement.ReadWrite.Directory
+# is not requested — the operator's consent prompt is narrowed to match what the run actually does.
+$graphConnectScopes = @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All')
+if (-not $AzureOnly) { $graphConnectScopes += 'RoleManagement.ReadWrite.Directory' }
+Connect-MgGraph -TenantId $TenantId -Scopes $graphConnectScopes | Out-Null
 
 Write-Host "  Resolving Microsoft Graph service principal and permission IDs..." -ForegroundColor Cyan
 
@@ -397,287 +561,360 @@ if (-not $graphServicePrincipal) {
 $graphSpId = $graphServicePrincipal.Id
 $graphAppId = $graphServicePrincipal.AppId   # Well-known: 00000003-0000-0000-c000-000000000000
 
-# Build the required resource access list
-$resourceAccess = @()
-foreach ($permName in $requiredGraphPermissions) {
-    $appRole = $graphServicePrincipal.AppRoles | Where-Object { $_.Value -eq $permName }
-    if (-not $appRole) {
-        Write-Warn "  Permission '$permName' not found in Graph app roles — skipping."
-        continue
-    }
-    $resourceAccess += @{
-        Id   = $appRole.Id
-        Type = 'Role'
-    }
-}
-
-# Office 365 Exchange Online (for R-613 PowerShell collection) — Exchange.ManageAsApp app role.
-$exoAppId = '00000002-0000-0ff1-ce00-000000000000'
-$exoSp = Get-MgServicePrincipal -Filter "appId eq '$exoAppId'" | Select-Object -First 1
-$exoResourceAccess = @()
-if ($exoSp) {
-    $exoRole = $exoSp.AppRoles | Where-Object { $_.Value -eq 'Exchange.ManageAsApp' }
-    if ($exoRole) {
-        $exoResourceAccess += @{ Id = $exoRole.Id; Type = 'Role' }
-    } else {
-        Write-Warn "  'Exchange.ManageAsApp' app role not found on Exchange Online SP — skipping."
-    }
-} else {
-    Write-Warn "  Office 365 Exchange Online service principal not found in tenant — skipping Exchange.ManageAsApp."
-}
-
-# SharePoint Online (for R-613 PnP collection — Get-PnPTenant / Get-PnPTenantSite) — Sites.FullControl.All app role.
-$spoAppId = '00000003-0000-0ff1-ce00-000000000000'
-$spoSp = Get-MgServicePrincipal -Filter "appId eq '$spoAppId'" | Select-Object -First 1
-$spoResourceAccess = @()
-if ($spoSp) {
-    $spoRole = $spoSp.AppRoles | Where-Object { $_.Value -eq 'Sites.FullControl.All' }
-    if ($spoRole) {
-        $spoResourceAccess += @{ Id = $spoRole.Id; Type = 'Role' }
-    } else {
-        Write-Warn "  'Sites.FullControl.All' app role not found on SharePoint Online SP — skipping."
-    }
-} else {
-    Write-Warn "  SharePoint Online service principal not found in tenant — skipping Sites.FullControl.All."
-}
-
-# Power BI Service (for CIS Section 9 Power BI / Fabric checks) — Tenant.Read.All app role.
-# NOTE: this grant is necessary but NOT sufficient — a Power BI/Fabric Service Admin must ALSO enable
-# "Service principals can use read-only Power BI admin APIs" in the Power BI admin portal (Tenant settings).
-$pbiAppId = '00000009-0000-0000-c000-000000000000'
-$pbiSp = Get-MgServicePrincipal -Filter "appId eq '$pbiAppId'" | Select-Object -First 1
-$pbiResourceAccess = @()
-if ($pbiSp) {
-    $pbiRole = $pbiSp.AppRoles | Where-Object { $_.Value -eq 'Tenant.Read.All' }
-    if ($pbiRole) {
-        $pbiResourceAccess += @{ Id = $pbiRole.Id; Type = 'Role' }
-    } else {
-        Write-Warn "  'Tenant.Read.All' app role not found on Power BI Service SP — skipping."
-    }
-} else {
-    Write-Warn "  Power BI Service service principal not found in tenant — skipping Tenant.Read.All."
-}
-
-$requiredResourceAccess = @(
-    @{
-        ResourceAppId  = $graphAppId
-        ResourceAccess = $resourceAccess
-    }
-)
-if ($exoResourceAccess.Count -gt 0) {
-    $requiredResourceAccess += @{ ResourceAppId = $exoAppId; ResourceAccess = $exoResourceAccess }
-}
-if ($spoResourceAccess.Count -gt 0) {
-    $requiredResourceAccess += @{ ResourceAppId = $spoAppId; ResourceAccess = $spoResourceAccess }
-}
-if ($pbiResourceAccess.Count -gt 0) {
-    $requiredResourceAccess += @{ ResourceAppId = $pbiAppId; ResourceAccess = $pbiResourceAccess }
-}
-
-$m365App = $null
-$m365Sp = $null
-$m365SpCreated = $false
+# Declared up front so the credentials/summary blocks can test them on the -AzureOnly path, where
+# no M365 app exists. Set-StrictMode would otherwise fault on the first unassigned reference.
+$m365AppName = $null
+$m365AppId = $null
+$m365SecretText = $null
 $consentFailures = @()
-try {
-    $existingM365App = Get-MgApplication -Filter "displayName eq '$m365AppName'" -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($existingM365App) {
-        Write-Host "  Reusing existing app registration: $m365AppName" -ForegroundColor Gray
-        $m365App = $existingM365App
-        if ($PermissionsOnly) {
-            # Ensure the manifest lists the (possibly newly-added) required resource access so the
-            # consents below have a declared permission to bind to. Idempotent / additive.
-            try {
-                Update-MgApplication -ApplicationId $m365App.Id -RequiredResourceAccess $requiredResourceAccess -ErrorAction Stop
-                Write-Host "    Updated app manifest with current required permissions" -ForegroundColor Gray
-            } catch {
-                Write-Warn "  Could not update app manifest (continuing — consents are granted directly): $($_.Exception.Message)"
-            }
-        }
-    } elseif ($PermissionsOnly) {
-        throw "PermissionsOnly: M365 app registration '$m365AppName' not found. Run without -PermissionsOnly to create it."
-    } else {
-        Write-Host "  Creating app registration '$m365AppName' with $($resourceAccess.Count) permissions..." -ForegroundColor Cyan
-        $m365App = New-MgApplication `
-            -DisplayName $m365AppName `
-            -RequiredResourceAccess $requiredResourceAccess `
-            -SignInAudience 'AzureADMyOrg'
-    }
 
-    $existingM365Sp = Get-MgServicePrincipal -Filter "appId eq '$($m365App.AppId)'" -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if ($existingM365Sp) {
-        Write-Host "  Reusing existing service principal for '$m365AppName'..." -ForegroundColor Gray
-        $m365Sp = $existingM365Sp
-    } elseif ($PermissionsOnly) {
-        throw "PermissionsOnly: service principal for '$m365AppName' not found. Run without -PermissionsOnly to create it."
-    } else {
-        Write-Host "  Creating service principal for '$m365AppName'..." -ForegroundColor Cyan
-        $m365Sp = New-MgServicePrincipal -AppId $m365App.AppId
-        $m365SpCreated = $true
-        Wait-SpPropagation -ObjectId $m365Sp.Id
-    }
+# R-619 — make the Azure RM service principal (created via Az in Step 2) a self-managing Graph app:
+# grant Application.ReadWrite.OwnedBy + self-ownership so PAA can rotate its own certificate. Needs
+# the active Connect-MgGraph session, which is why it lives in Step 3 rather than Step 2. It runs on
+# BOTH paths — an -AzureOnly principal would otherwise be left on the expiring bootstrap secret with
+# nothing to rotate it (the bug that made Azure-only onboarding unusable before this switch existed).
+Write-Host "  Granting self-managed cert bootstrap to the Azure service principal..." -ForegroundColor Cyan
+Set-SelfManagedCertBootstrap `
+    -AppId $azAppId `
+    -Label 'Azure' `
+    -GraphServicePrincipal $graphServicePrincipal `
+    -ConsentFailures ([ref]$consentFailures)
 
-    # Attempt admin consent for each permission
-    Write-Host "  Attempting admin consent for Graph permissions..." -ForegroundColor Cyan
-
-    foreach ($permName in $requiredGraphPermissions) {
-        $appRole = $graphServicePrincipal.AppRoles | Where-Object { $_.Value -eq $permName }
-        if (-not $appRole) { continue }
-
-        try {
-            New-MgServicePrincipalAppRoleAssignment `
-                -ServicePrincipalId $m365Sp.Id `
-                -PrincipalId $m365Sp.Id `
-                -ResourceId $graphSpId `
-                -AppRoleId $appRole.Id `
-                -ErrorAction Stop | Out-Null
-            Write-Host "    Consented: $permName" -ForegroundColor Gray
-        } catch {
-            $consentFailures += $permName
-            Write-Warn "  Admin consent failed for '$permName': $($_.Exception.Message)"
-        }
-    }
-
-    if ($exoSp -and $exoResourceAccess.Count -gt 0) {
-        try {
-            New-MgServicePrincipalAppRoleAssignment `
-                -ServicePrincipalId $m365Sp.Id `
-                -PrincipalId $m365Sp.Id `
-                -ResourceId $exoSp.Id `
-                -AppRoleId $exoResourceAccess[0].Id `
-                -ErrorAction Stop | Out-Null
-            Write-Host "    Consented: Exchange.ManageAsApp" -ForegroundColor Gray
-        } catch {
-            $consentFailures += 'Exchange.ManageAsApp'
-            Write-Warn "  Admin consent failed for 'Exchange.ManageAsApp': $($_.Exception.Message)"
-        }
-    }
-
-    if ($spoSp -and $spoResourceAccess.Count -gt 0) {
-        try {
-            New-MgServicePrincipalAppRoleAssignment `
-                -ServicePrincipalId $m365Sp.Id `
-                -PrincipalId $m365Sp.Id `
-                -ResourceId $spoSp.Id `
-                -AppRoleId $spoResourceAccess[0].Id `
-                -ErrorAction Stop | Out-Null
-            Write-Host "    Consented: Sites.FullControl.All (SharePoint)" -ForegroundColor Gray
-        } catch {
-            $consentFailures += 'Sites.FullControl.All'
-            Write-Warn "  Admin consent failed for 'Sites.FullControl.All': $($_.Exception.Message)"
-        }
-    }
-
-    if ($pbiSp -and $pbiResourceAccess.Count -gt 0) {
-        try {
-            New-MgServicePrincipalAppRoleAssignment `
-                -ServicePrincipalId $m365Sp.Id `
-                -PrincipalId $m365Sp.Id `
-                -ResourceId $pbiSp.Id `
-                -AppRoleId $pbiResourceAccess[0].Id `
-                -ErrorAction Stop | Out-Null
-            Write-Host "    Consented: Tenant.Read.All (Power BI)" -ForegroundColor Gray
-        } catch {
-            $consentFailures += 'Tenant.Read.All'
-            Write-Warn "  Admin consent failed for 'Tenant.Read.All': $($_.Exception.Message)"
-        }
-    }
-
-    # Assign Global Reader (read-only directory role) — clean lever for R-613 PowerShell surfaces.
-    $globalReaderTemplateId = 'f2ef992c-3afb-46b9-b7cf-a126ee74c451'
-    try {
-        New-MgRoleManagementDirectoryRoleAssignment -BodyParameter @{
-            PrincipalId      = $m365Sp.Id
-            RoleDefinitionId = $globalReaderTemplateId
-            DirectoryScopeId = '/'
-        } -ErrorAction Stop | Out-Null
-        Write-Host "    Assigned directory role: Global Reader" -ForegroundColor Gray
-    } catch {
-        Write-Warn "  Could not assign Global Reader (may already be assigned): $($_.Exception.Message)"
-    }
-
-    # R-613 Power Platform — register the M365 app as a Power Platform management application so it
-    # can read tenant settings + DLP policies via the BAP admin REST API (SCUBA-PP-1.1/1.2/2.1/4.1 +
-    # MT.1099/1100/1101). New-PowerAppManagementApp is .NET-Framework/PS-5.x-only (can't run in this
-    # pwsh-7 script), so we call its REST equivalent. This endpoint REQUIRES a signed-in ADMIN USER
-    # token (client-credentials is rejected) — the Connect-AzAccount session from Step 2 provides it;
-    # the admin must hold Power Platform Administrator / Global Administrator (ManageAdminApplications).
-    Write-Host "  Registering app as a Power Platform management application (BAP REST)..." -ForegroundColor Cyan
-    try {
-        $bapTokenObj = Get-AzAccessToken -ResourceUrl 'https://service.powerapps.com/' -ErrorAction Stop
-        # Az.Accounts >= 5.0 returns the token as a SecureString by default; older versions return plaintext.
-        $bapToken = if ($bapTokenObj.Token -is [System.Security.SecureString]) {
-            [System.Net.NetworkCredential]::new('', $bapTokenObj.Token).Password
-        } else { $bapTokenObj.Token }
-
-        $ppRegUri = "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/adminApplications/$($m365App.AppId)?api-version=2020-10-01"
-        Invoke-RestMethod -Method Put -Uri $ppRegUri `
-            -Headers @{ Authorization = "Bearer $bapToken" } -ContentType 'application/json' -ErrorAction Stop | Out-Null
-        Write-Host "    Registered: Power Platform management application" -ForegroundColor Gray
-    } catch {
-        $consentFailures += 'Power Platform management app (New-PowerAppManagementApp)'
-        Write-Warn "  Power Platform management-app registration failed: $($_.Exception.Message)"
-        Write-Warn "  The signed-in admin must hold Power Platform Administrator / Global Administrator."
-        Write-Warn "  Fallback (Windows PowerShell 5.1, as a PP admin): New-PowerAppManagementApp -ApplicationId $($m365App.AppId)"
-    }
-
-    # TODO (R-619): this OwnedBy + self-ownership logic overlaps Set-SelfManagedCertBootstrap; left inline because the M365 app also threads Exchange.ManageAsApp + Global Reader. Converge if that changes.
-    # Self-ownership — Application.ReadWrite.OwnedBy only applies to apps the SP owns.
-    try {
-        $ownerRef = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($m365Sp.Id)" }
-        New-MgApplicationOwnerByRef -ApplicationId $m365App.Id -BodyParameter $ownerRef -ErrorAction Stop
-        Write-Host "    Set service principal as owner of its own app registration" -ForegroundColor Gray
-    } catch {
-        Write-Warn "  Could not set self-ownership (may already be owner): $($_.Exception.Message)"
-    }
-
-    # R-619 — make the Azure RM service principal (created via Az in Step 2) a self-managing
-    # Graph app: grant Application.ReadWrite.OwnedBy + self-ownership so PAA can rotate its
-    # own certificate. Done here because it needs the active Connect-MgGraph session.
-    Write-Host "  Granting self-managed cert bootstrap to the Azure service principal..." -ForegroundColor Cyan
-    Set-SelfManagedCertBootstrap `
-        -AppId $azAppId `
-        -Label 'Azure' `
-        -GraphServicePrincipal $graphServicePrincipal `
-        -ConsentFailures ([ref]$consentFailures)
+if ($AzureOnly) {
+    Write-Host ""
+    Write-Host "  -AzureOnly: skipping the M365 Graph app registration." -ForegroundColor DarkCyan
+    Write-Host "    NOT created  : PAA-M365-* app registration and service principal" -ForegroundColor Gray
+    Write-Host "    NOT requested: every Microsoft Graph application permission" -ForegroundColor Gray
+    Write-Host "    NOT consented: Exchange.ManageAsApp, Sites.FullControl.All, Tenant.Read.All" -ForegroundColor Gray
+    Write-Host "    NOT assigned : Global Reader directory role" -ForegroundColor Gray
+    Write-Host "    NOT registered: Power Platform management application" -ForegroundColor Gray
+    Write-Host "    Consequence  : M365, Entra ID and Zero Trust checks report as not evaluated." -ForegroundColor Gray
+    Write-Host ""
 
     if ($consentFailures.Count -gt 0) {
-        Write-Host ""
-        Write-Host "  ACTION REQUIRED: The following permissions need manual admin consent in the Azure portal:" -ForegroundColor DarkYellow
-        Write-Host "  Portal URL: https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$($m365App.AppId)/isMSAApp/" -ForegroundColor DarkYellow
+        Write-Host "  ACTION REQUIRED: the following need manual admin consent in the Azure portal:" -ForegroundColor DarkYellow
+        Write-Host "  https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$azAppId/isMSAApp/" -ForegroundColor DarkYellow
         $consentFailures | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkYellow }
         Write-Host ""
     }
+}
 
-    $m365AppId = $m365App.AppId
+# The M365 Graph app registration. Skipped entirely under -AzureOnly: no app, no Graph
+# permission, no Exchange/SharePoint/Power BI app role, no Global Reader, no Power Platform
+# registration. See .PARAMETER AzureOnly.
+if (-not $AzureOnly) {
+    # Stable app name based on tenant ID — idempotent across runs
+    $m365AppName = "PAA-M365-$($TenantId.Substring(0, 8))"
 
-    # Bootstrap-only secret: PAA discards it after generating the certificate (R-618).
-    # Skipped in -PermissionsOnly (the app already has cert auth; no new credential needed).
-    if (-not $PermissionsOnly) {
-        $m365SecretExpiry = (Get-Date).AddDays($bootstrapSecretDays)
-        $m365SecretParams = @{
-            ApplicationId      = $m365App.Id
-            PasswordCredential = @{
-                DisplayName = 'PAA-Secret'
-                EndDateTime = $m365SecretExpiry
+    # Required Graph application permissions (type = Role). Least-privilege set, cross-checked
+    # against actual collector/ZeroTrust endpoint usage. All read-only EXCEPT
+    # Application.ReadWrite.OwnedBy, which is self-scoped (manages only this app's own credential,
+    # per R-618). Directory.Read.All is the umbrella for directory-object reads (applications,
+    # servicePrincipals, organization, groups, users, directoryRoles, domains) — narrower roles it
+    # already covers (Application.Read.All / Organization.Read.All / Group.Read.All) are NOT granted.
+    $requiredGraphPermissions = @(
+        'Directory.Read.All',                    # Directory objects: roles, users, SPs, apps, groups, org, domains
+        'Policy.Read.All',                       # CA / auth-method / authorization / cross-tenant-access / app-mgmt policies
+        'RoleManagement.Read.Directory',         # PIM schedules + role management policies
+        'AccessReview.Read.All',                 # Access review definitions/instances (P2)
+        'DelegatedAdminRelationship.Read.All',   # GDAP partner relationships
+        'DelegatedPermissionGrant.Read.All',     # OAuth2 delegated grants (oauth2PermissionGrants)
+        'IdentityRiskyUser.Read.All',            # Identity Protection risky users (P2)
+        'AuditLog.Read.All',                     # signInActivity on guest users
+        'Reports.Read.All',                      # assigned-but-inactive M365 license detection (R-610); degrades gracefully if absent
+        'DeviceManagementManagedDevices.Read.All',
+        'DeviceManagementConfiguration.Read.All',
+        'DeviceManagementApps.Read.All',
+        # R-753: four collector endpoints have been failing with 403 on every tenant since they were
+        # written, each naming the scope it wanted. Found by the Local Scan acceptance run (2026-08-13),
+        # but the gap is here too — this list is where Local Scan's was ported from.
+        # ⚠ Graph's 403 text also names "DeviceManagementServiceConfiguration.Read.All"; that is NOT a
+        # real Graph app role. Only the shorter form below exists, and requesting the other silently
+        # grants nothing.
+        'DeviceManagementServiceConfig.Read.All',   # enrollment restrictions, MTD connectors, Autopilot
+        'DeviceManagementRBAC.Read.All',            # Intune operation-approval policies
+        'OnPremDirectorySynchronization.Read.All',  # Entra Connect sync configuration and state
+        'SecurityEvents.Read.All',               # Defender alerts + secure score + DfO beta policies
+        'SecurityIncident.Read.All',             # Defender incidents (CollectIncidentSummaryAsync)
+        'SharePointTenantSettings.Read.All',     # SharePoint / OneDrive admin settings
+        'NetworkAccess.Read.All',                # R-636: Global Secure Access / Entra Network config (config-only); degrades gracefully if absent / unlicensed
+        'Application.ReadWrite.OwnedBy'          # R-618: self-scoped cert bootstrap/rotation (this app only)
+    )
+
+    # Build the required resource access list
+    $resourceAccess = @()
+    foreach ($permName in $requiredGraphPermissions) {
+        $appRole = $graphServicePrincipal.AppRoles | Where-Object { $_.Value -eq $permName }
+        if (-not $appRole) {
+            Write-Warn "  Permission '$permName' not found in Graph app roles — skipping."
+            continue
+        }
+        $resourceAccess += @{
+            Id   = $appRole.Id
+            Type = 'Role'
+        }
+    }
+
+    # Office 365 Exchange Online (for R-613 PowerShell collection) — Exchange.ManageAsApp app role.
+    $exoAppId = '00000002-0000-0ff1-ce00-000000000000'
+    $exoSp = Get-MgServicePrincipal -Filter "appId eq '$exoAppId'" | Select-Object -First 1
+    $exoResourceAccess = @()
+    if ($exoSp) {
+        $exoRole = $exoSp.AppRoles | Where-Object { $_.Value -eq 'Exchange.ManageAsApp' }
+        if ($exoRole) {
+            $exoResourceAccess += @{ Id = $exoRole.Id; Type = 'Role' }
+        } else {
+            Write-Warn "  'Exchange.ManageAsApp' app role not found on Exchange Online SP — skipping."
+        }
+    } else {
+        Write-Warn "  Office 365 Exchange Online service principal not found in tenant — skipping Exchange.ManageAsApp."
+    }
+
+    # SharePoint Online (for R-613 PnP collection — Get-PnPTenant / Get-PnPTenantSite) — Sites.FullControl.All app role.
+    $spoAppId = '00000003-0000-0ff1-ce00-000000000000'
+    $spoSp = Get-MgServicePrincipal -Filter "appId eq '$spoAppId'" | Select-Object -First 1
+    $spoResourceAccess = @()
+    if ($spoSp) {
+        $spoRole = $spoSp.AppRoles | Where-Object { $_.Value -eq 'Sites.FullControl.All' }
+        if ($spoRole) {
+            $spoResourceAccess += @{ Id = $spoRole.Id; Type = 'Role' }
+        } else {
+            Write-Warn "  'Sites.FullControl.All' app role not found on SharePoint Online SP — skipping."
+        }
+    } else {
+        Write-Warn "  SharePoint Online service principal not found in tenant — skipping Sites.FullControl.All."
+    }
+
+    # Power BI Service (for CIS Section 9 Power BI / Fabric checks) — Tenant.Read.All app role.
+    # NOTE: this grant is necessary but NOT sufficient — a Power BI/Fabric Service Admin must ALSO enable
+    # "Service principals can use read-only Power BI admin APIs" in the Power BI admin portal (Tenant settings).
+    $pbiAppId = '00000009-0000-0000-c000-000000000000'
+    $pbiSp = Get-MgServicePrincipal -Filter "appId eq '$pbiAppId'" | Select-Object -First 1
+    $pbiResourceAccess = @()
+    if ($pbiSp) {
+        $pbiRole = $pbiSp.AppRoles | Where-Object { $_.Value -eq 'Tenant.Read.All' }
+        if ($pbiRole) {
+            $pbiResourceAccess += @{ Id = $pbiRole.Id; Type = 'Role' }
+        } else {
+            Write-Warn "  'Tenant.Read.All' app role not found on Power BI Service SP — skipping."
+        }
+    } else {
+        Write-Warn "  Power BI Service service principal not found in tenant — skipping Tenant.Read.All."
+    }
+
+    $requiredResourceAccess = @(
+        @{
+            ResourceAppId  = $graphAppId
+            ResourceAccess = $resourceAccess
+        }
+    )
+    if ($exoResourceAccess.Count -gt 0) {
+        $requiredResourceAccess += @{ ResourceAppId = $exoAppId; ResourceAccess = $exoResourceAccess }
+    }
+    if ($spoResourceAccess.Count -gt 0) {
+        $requiredResourceAccess += @{ ResourceAppId = $spoAppId; ResourceAccess = $spoResourceAccess }
+    }
+    if ($pbiResourceAccess.Count -gt 0) {
+        $requiredResourceAccess += @{ ResourceAppId = $pbiAppId; ResourceAccess = $pbiResourceAccess }
+    }
+
+    $m365App = $null
+    $m365Sp = $null
+    $m365SpCreated = $false
+    try {
+        $existingM365App = Get-MgApplication -Filter "displayName eq '$m365AppName'" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($existingM365App) {
+            Write-Host "  Reusing existing app registration: $m365AppName" -ForegroundColor Gray
+            $m365App = $existingM365App
+            if ($PermissionsOnly) {
+                # Ensure the manifest lists the (possibly newly-added) required resource access so the
+                # consents below have a declared permission to bind to. Idempotent / additive.
+                try {
+                    Update-MgApplication -ApplicationId $m365App.Id -RequiredResourceAccess $requiredResourceAccess -ErrorAction Stop
+                    Write-Host "    Updated app manifest with current required permissions" -ForegroundColor Gray
+                } catch {
+                    Write-Warn "  Could not update app manifest (continuing — consents are granted directly): $($_.Exception.Message)"
+                }
+            }
+        } elseif ($PermissionsOnly) {
+            throw "PermissionsOnly: M365 app registration '$m365AppName' not found. Run without -PermissionsOnly to create it."
+        } else {
+            Write-Host "  Creating app registration '$m365AppName' with $($resourceAccess.Count) permissions..." -ForegroundColor Cyan
+            $m365App = New-MgApplication `
+                -DisplayName $m365AppName `
+                -RequiredResourceAccess $requiredResourceAccess `
+                -SignInAudience 'AzureADMyOrg'
+        }
+
+        $existingM365Sp = Get-MgServicePrincipal -Filter "appId eq '$($m365App.AppId)'" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($existingM365Sp) {
+            Write-Host "  Reusing existing service principal for '$m365AppName'..." -ForegroundColor Gray
+            $m365Sp = $existingM365Sp
+        } elseif ($PermissionsOnly) {
+            throw "PermissionsOnly: service principal for '$m365AppName' not found. Run without -PermissionsOnly to create it."
+        } else {
+            Write-Host "  Creating service principal for '$m365AppName'..." -ForegroundColor Cyan
+            $m365Sp = New-MgServicePrincipal -AppId $m365App.AppId
+            $m365SpCreated = $true
+            Wait-SpPropagation -ObjectId $m365Sp.Id
+        }
+
+        # Attempt admin consent for each permission
+        Write-Host "  Attempting admin consent for Graph permissions..." -ForegroundColor Cyan
+
+        foreach ($permName in $requiredGraphPermissions) {
+            $appRole = $graphServicePrincipal.AppRoles | Where-Object { $_.Value -eq $permName }
+            if (-not $appRole) { continue }
+
+            try {
+                New-MgServicePrincipalAppRoleAssignment `
+                    -ServicePrincipalId $m365Sp.Id `
+                    -PrincipalId $m365Sp.Id `
+                    -ResourceId $graphSpId `
+                    -AppRoleId $appRole.Id `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "    Consented: $permName" -ForegroundColor Gray
+            } catch {
+                $consentFailures += $permName
+                Write-Warn "  Admin consent failed for '$permName': $($_.Exception.Message)"
             }
         }
-        $m365SecretResult = Add-MgApplicationPassword @m365SecretParams
-        $m365SecretText = $m365SecretResult.SecretText
-    }
 
-    Write-Success "  M365 app registration ready: $m365AppName (AppId: $m365AppId)"
-} catch {
-    if ($m365SpCreated -and $m365Sp) {
-        Write-Warning "Rolling back M365 service principal for '$m365AppName'..."
-        try { Remove-MgServicePrincipal -ServicePrincipalId $m365Sp.Id -ErrorAction SilentlyContinue } catch {}
+        if ($exoSp -and $exoResourceAccess.Count -gt 0) {
+            try {
+                New-MgServicePrincipalAppRoleAssignment `
+                    -ServicePrincipalId $m365Sp.Id `
+                    -PrincipalId $m365Sp.Id `
+                    -ResourceId $exoSp.Id `
+                    -AppRoleId $exoResourceAccess[0].Id `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "    Consented: Exchange.ManageAsApp" -ForegroundColor Gray
+            } catch {
+                $consentFailures += 'Exchange.ManageAsApp'
+                Write-Warn "  Admin consent failed for 'Exchange.ManageAsApp': $($_.Exception.Message)"
+            }
+        }
+
+        if ($spoSp -and $spoResourceAccess.Count -gt 0) {
+            try {
+                New-MgServicePrincipalAppRoleAssignment `
+                    -ServicePrincipalId $m365Sp.Id `
+                    -PrincipalId $m365Sp.Id `
+                    -ResourceId $spoSp.Id `
+                    -AppRoleId $spoResourceAccess[0].Id `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "    Consented: Sites.FullControl.All (SharePoint)" -ForegroundColor Gray
+            } catch {
+                $consentFailures += 'Sites.FullControl.All'
+                Write-Warn "  Admin consent failed for 'Sites.FullControl.All': $($_.Exception.Message)"
+            }
+        }
+
+        if ($pbiSp -and $pbiResourceAccess.Count -gt 0) {
+            try {
+                New-MgServicePrincipalAppRoleAssignment `
+                    -ServicePrincipalId $m365Sp.Id `
+                    -PrincipalId $m365Sp.Id `
+                    -ResourceId $pbiSp.Id `
+                    -AppRoleId $pbiResourceAccess[0].Id `
+                    -ErrorAction Stop | Out-Null
+                Write-Host "    Consented: Tenant.Read.All (Power BI)" -ForegroundColor Gray
+            } catch {
+                $consentFailures += 'Tenant.Read.All'
+                Write-Warn "  Admin consent failed for 'Tenant.Read.All': $($_.Exception.Message)"
+            }
+        }
+
+        # Assign Global Reader (read-only directory role) — clean lever for R-613 PowerShell surfaces.
+        $globalReaderTemplateId = 'f2ef992c-3afb-46b9-b7cf-a126ee74c451'
+        try {
+            New-MgRoleManagementDirectoryRoleAssignment -BodyParameter @{
+                PrincipalId      = $m365Sp.Id
+                RoleDefinitionId = $globalReaderTemplateId
+                DirectoryScopeId = '/'
+            } -ErrorAction Stop | Out-Null
+            Write-Host "    Assigned directory role: Global Reader" -ForegroundColor Gray
+        } catch {
+            Write-Warn "  Could not assign Global Reader (may already be assigned): $($_.Exception.Message)"
+        }
+
+        # R-613 Power Platform — register the M365 app as a Power Platform management application so it
+        # can read tenant settings + DLP policies via the BAP admin REST API (SCUBA-PP-1.1/1.2/2.1/4.1 +
+        # MT.1099/1100/1101). New-PowerAppManagementApp is .NET-Framework/PS-5.x-only (can't run in this
+        # pwsh-7 script), so we call its REST equivalent. This endpoint REQUIRES a signed-in ADMIN USER
+        # token (client-credentials is rejected) — the Connect-AzAccount session from Step 2 provides it;
+        # the admin must hold Power Platform Administrator / Global Administrator (ManageAdminApplications).
+        Write-Host "  Registering app as a Power Platform management application (BAP REST)..." -ForegroundColor Cyan
+        try {
+            $bapTokenObj = Get-AzAccessToken -ResourceUrl 'https://service.powerapps.com/' -ErrorAction Stop
+            # Az.Accounts >= 5.0 returns the token as a SecureString by default; older versions return plaintext.
+            $bapToken = if ($bapTokenObj.Token -is [System.Security.SecureString]) {
+                [System.Net.NetworkCredential]::new('', $bapTokenObj.Token).Password
+            } else { $bapTokenObj.Token }
+
+            $ppRegUri = "https://api.bap.microsoft.com/providers/Microsoft.BusinessAppPlatform/adminApplications/$($m365App.AppId)?api-version=2020-10-01"
+            Invoke-RestMethod -Method Put -Uri $ppRegUri `
+                -Headers @{ Authorization = "Bearer $bapToken" } -ContentType 'application/json' -ErrorAction Stop | Out-Null
+            Write-Host "    Registered: Power Platform management application" -ForegroundColor Gray
+        } catch {
+            $consentFailures += 'Power Platform management app (New-PowerAppManagementApp)'
+            Write-Warn "  Power Platform management-app registration failed: $($_.Exception.Message)"
+            Write-Warn "  The signed-in admin must hold Power Platform Administrator / Global Administrator."
+            Write-Warn "  Fallback (Windows PowerShell 5.1, as a PP admin): New-PowerAppManagementApp -ApplicationId $($m365App.AppId)"
+        }
+
+        # TODO (R-619): this OwnedBy + self-ownership logic overlaps Set-SelfManagedCertBootstrap; left inline because the M365 app also threads Exchange.ManageAsApp + Global Reader. Converge if that changes.
+        # Self-ownership — Application.ReadWrite.OwnedBy only applies to apps the SP owns.
+        try {
+            $ownerRef = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$($m365Sp.Id)" }
+            New-MgApplicationOwnerByRef -ApplicationId $m365App.Id -BodyParameter $ownerRef -ErrorAction Stop
+            Write-Host "    Set service principal as owner of its own app registration" -ForegroundColor Gray
+        } catch {
+            Write-Warn "  Could not set self-ownership (may already be owner): $($_.Exception.Message)"
+        }
+
+        # (The Azure SP's own cert bootstrap now runs at the top of Step 3, before this block, so that
+        # -AzureOnly still gets it. R-619.)
+
+        if ($consentFailures.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  ACTION REQUIRED: The following permissions need manual admin consent in the Azure portal:" -ForegroundColor DarkYellow
+            Write-Host "  Portal URL: https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$($m365App.AppId)/isMSAApp/" -ForegroundColor DarkYellow
+            $consentFailures | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkYellow }
+            Write-Host ""
+        }
+
+        $m365AppId = $m365App.AppId
+
+        # Bootstrap-only secret: PAA discards it after generating the certificate (R-618).
+        # Skipped in -PermissionsOnly (the app already has cert auth; no new credential needed).
+        if (-not $PermissionsOnly) {
+            $m365SecretExpiry = (Get-Date).AddDays($bootstrapSecretDays)
+            $m365SecretParams = @{
+                ApplicationId      = $m365App.Id
+                PasswordCredential = @{
+                    DisplayName = 'PAA-Secret'
+                    EndDateTime = $m365SecretExpiry
+                }
+            }
+            $m365SecretResult = Add-MgApplicationPassword @m365SecretParams
+            $m365SecretText = $m365SecretResult.SecretText
+        }
+
+        Write-Success "  M365 app registration ready: $m365AppName (AppId: $m365AppId)"
+    } catch {
+        if ($m365SpCreated -and $m365Sp) {
+            Write-Warning "Rolling back M365 service principal for '$m365AppName'..."
+            try { Remove-MgServicePrincipal -ServicePrincipalId $m365Sp.Id -ErrorAction SilentlyContinue } catch {}
+        }
+        if ($m365App -and -not $existingM365App) {
+            Write-Warning "Rolling back M365 app registration '$m365AppName'..."
+            Remove-MgApplication -ApplicationId $m365App.Id -ErrorAction SilentlyContinue
+        }
+        throw "M365 app registration failed: $_"
     }
-    if ($m365App -and -not $existingM365App) {
-        Write-Warning "Rolling back M365 app registration '$m365AppName'..."
-        Remove-MgApplication -ApplicationId $m365App.Id -ErrorAction SilentlyContinue
-    }
-    throw "M365 app registration failed: $_"
 }
 
 # ---------------------------------------------------------------------------
@@ -740,20 +977,22 @@ if ($IncludeLogAnalytics -and -not $PermissionsOnly) {
             $laReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'  # Log Analytics Reader
             if ($azSp) {
                 Write-Host "  Assigning Log Analytics Reader on workspace to $azSpName..." -ForegroundColor Cyan
-                try {
-                    New-AzRoleAssignment -ObjectId $azSp.Id -RoleDefinitionId $laReaderRoleId -Scope $workspaceArmId -ErrorAction SilentlyContinue | Out-Null
-                } catch {}
-                # Verify the assignment rather than assuming the silent call succeeded.
-                try {
-                    $verifiedAssignment = Get-AzRoleAssignment -ObjectId $azSp.Id -Scope $workspaceArmId -RoleDefinitionId $laReaderRoleId -ErrorAction SilentlyContinue
-                    if ($verifiedAssignment) {
-                        $workspaceRoleGranted = $true
-                        Write-Success "  Log Analytics Reader confirmed on workspace (allows PAA to query workspaces outside scan subscriptions)."
-                    } else {
-                        Write-Warn "  Log Analytics Reader role grant could not be confirmed — manual grant may be needed (or allow a few seconds for RBAC propagation and re-run)."
-                    }
-                } catch {
-                    Write-Warn "  Log Analytics Reader role verification failed: $($_.Exception.Message) — manual grant confirmation may be needed."
+
+                # R-749: this block already verified — it is where the lesson was first learned, and
+                # its comment asked for exactly the retry the shared helper now provides ("allow a few
+                # seconds for RBAC propagation and re-run"). Folded onto Grant-AzureRoleVerified so
+                # there is one implementation rather than a good one here and none in the main loop.
+                # The scope is a workspace rather than a subscription; the helper does not care.
+                $workspaceResult = Grant-AzureRoleVerified -ObjectId $azSp.Id `
+                    -RoleDefinitionId $laReaderRoleId -RoleName 'Log Analytics Reader' `
+                    -Scope $workspaceArmId -SubscriptionName 'workspace'
+
+                if ($workspaceResult.Outcome -in @('Granted', 'AlreadyAssigned')) {
+                    $workspaceRoleGranted = $true
+                    Write-Success "  Log Analytics Reader confirmed on workspace (allows PAA to query workspaces outside scan subscriptions)."
+                } else {
+                    Write-Warn "  Log Analytics Reader could not be confirmed — $($workspaceResult.Reason)"
+                    Write-Warn "  A manual grant may be needed; PAA cannot query this workspace without it."
                 }
             } else {
                 Write-Warn "  Azure service principal not available — skipping Log Analytics Reader grant on workspace."
@@ -844,10 +1083,23 @@ if ($IncludeDefenderCspm) {
             Wait-SpPropagation -ObjectId $defenderSp.Id
         }
 
+        # R-749: same treatment as the Azure SP above — assign, then confirm by reading it back.
+        $defenderRoleResults = @()
         foreach ($sub in $subscriptions) {
             $scope = "/subscriptions/$($sub.Id)"
             Write-Host "    Assigning Security Reader (Defender) on $($sub.Name)..." -ForegroundColor Gray
-            New-AzRoleAssignment -ObjectId $defenderSp.Id -RoleDefinitionId $securityReaderRoleId -Scope $scope -ErrorAction SilentlyContinue | Out-Null
+            $defenderRoleResults += Grant-AzureRoleVerified -ObjectId $defenderSp.Id `
+                -RoleDefinitionId $securityReaderRoleId -RoleName 'Security Reader (Defender)' `
+                -Scope $scope -SubscriptionName $sub.Name
+        }
+
+        $defenderFailed = @($defenderRoleResults | Where-Object { $_.Outcome -eq 'Failed' })
+        if ($defenderFailed.Count -gt 0) {
+            Write-Warn "  $($defenderFailed.Count) Defender role assignment(s) could NOT be confirmed:"
+            foreach ($f in $defenderFailed) {
+                Write-Warn "    - $($f.Subscription) — $($f.Reason)"
+            }
+            Write-Warn "  Defender CSPM data for those subscriptions will be unavailable to PAA."
         }
 
         $defenderAppId = $defenderSp.AppId
@@ -893,24 +1145,33 @@ if ($PermissionsOnly) {
     Write-Host "================================================================" -ForegroundColor Green
     Write-Host "  Tenant ID         : $TenantId"
     Write-Host "  Azure SP          : $azSpName ($azAppId)"
-    Write-Host "  M365 app          : $m365AppName ($m365AppId)"
-    Write-Host "  Re-applied        : Azure roles (Reader/Security Reader/Cost Mgmt Reader);"
-    Write-Host "                      Graph app roles + Exchange.ManageAsApp + Sites.FullControl.All"
-    Write-Host "                      + Tenant.Read.All (Power BI) + Global Reader; Power Platform"
-    Write-Host "                      management-app registration (BAP); self-managed cert ownership."
+    if ($AzureOnly) {
+        Write-Host "  M365 app          : not created (-AzureOnly)"
+        Write-Host "  Re-applied        : Azure roles (Reader/Security Reader/Cost Mgmt Reader);"
+        Write-Host "                      self-managed cert ownership. No Graph/Exchange/SharePoint/"
+        Write-Host "                      Power BI/Global Reader/Power Platform grants."
+    } else {
+        Write-Host "  M365 app          : $m365AppName ($m365AppId)"
+        Write-Host "  Re-applied        : Azure roles (Reader/Security Reader/Cost Mgmt Reader);"
+        Write-Host "                      Graph app roles + Exchange.ManageAsApp + Sites.FullControl.All"
+        Write-Host "                      + Tenant.Read.All (Power BI) + Global Reader; Power Platform"
+        Write-Host "                      management-app registration (BAP); self-managed cert ownership."
+    }
     if ($IncludeDefenderCspm -and $defenderAppId) {
         Write-Host "  Defender SP       : $defenderSpName ($defenderAppId) — Security Reader re-applied"
     }
     if ($consentFailures.Count -gt 0) {
         Write-Host ""
         Write-Host "  ACTION REQUIRED — grant these manually (admin consent in the Azure portal):" -ForegroundColor DarkYellow
-        Write-Host "  https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$m365AppId/isMSAApp/" -ForegroundColor DarkYellow
+        Write-Host "  https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$(if ($AzureOnly) { $azAppId } else { $m365AppId })/isMSAApp/" -ForegroundColor DarkYellow
         $consentFailures | ForEach-Object { Write-Host "    - $_" -ForegroundColor DarkYellow }
     }
     Write-Host ""
-    Write-Host "  Power BI / Fabric (CIS §9): also enable 'Service principals can use read-only" -ForegroundColor Gray
-    Write-Host "  Power BI admin APIs' in the Power BI admin portal (manual, one-time)." -ForegroundColor Gray
-    Write-Host ""
+    if (-not $AzureOnly) {
+        Write-Host "  Power BI / Fabric (CIS §9): also enable 'Service principals can use read-only" -ForegroundColor Gray
+        Write-Host "  Power BI admin APIs' in the Power BI admin portal (manual, one-time)." -ForegroundColor Gray
+        Write-Host ""
+    }
     Write-Success "Permissions-only run complete. No credentials file written (existing cert auth unchanged)."
     return
 }
@@ -938,12 +1199,22 @@ $credLines += "AZURE_CLIENT_ID=$azAppId"
 $credLines += "AZURE_CLIENT_SECRET=*** see below ***"
 $credLines += "AZURE_SUBSCRIPTION_IDS=$subscriptionIdList"
 $credLines += ""
-$credLines += "# -- M365 / Graph App Registration --"
-$credLines += "M365_TENANT_ID=$TenantId"
-$credLines += "M365_APP_NAME=$m365AppName"
-$credLines += "M365_CLIENT_ID=$m365AppId"
-$credLines += "M365_CLIENT_SECRET=*** see below ***"
-$credLines += ""
+if ($AzureOnly) {
+    $credLines += "# -- Microsoft 365 / Graph --"
+    $credLines += "# NOT ONBOARDED: this tenant was onboarded with -AzureOnly. No M365 app registration"
+    $credLines += "# exists, no Graph application permission was requested, and no Exchange, SharePoint,"
+    $credLines += "# Power BI, Global Reader or Power Platform grant was made. Leave the Microsoft 365"
+    $credLines += "# section in PAA > Settings > Integrations empty. M365, Entra ID and Zero Trust checks"
+    $credLines += "# will report as not evaluated until a separate onboarding grants that access."
+    $credLines += ""
+} else {
+    $credLines += "# -- M365 / Graph App Registration --"
+    $credLines += "M365_TENANT_ID=$TenantId"
+    $credLines += "M365_APP_NAME=$m365AppName"
+    $credLines += "M365_CLIENT_ID=$m365AppId"
+    $credLines += "M365_CLIENT_SECRET=*** see below ***"
+    $credLines += ""
+}
 
 if ($logAnalyticsWorkspaceId) {
     $credLines += "# -- Log Analytics --"
@@ -970,7 +1241,9 @@ $credLines += "# ============================================================"
 $credLines += "#  SECRETS — DELETE THIS FILE AFTER USE"
 $credLines += "# ============================================================"
 $credLines += "AZURE_CLIENT_SECRET=$azSecretText"
-$credLines += "M365_CLIENT_SECRET=$m365SecretText"
+if (-not $AzureOnly) {
+    $credLines += "M365_CLIENT_SECRET=$m365SecretText"
+}
 
 if ($IncludeDefenderCspm -and $defenderSecretText) {
     $credLines += "DEFENDER_CLIENT_SECRET=$defenderSecretText"
@@ -983,24 +1256,33 @@ $credLines += "# ============================================================"
 $credLines += "# Azure SP roles: Reader, Security Reader, Cost Management Reader (on all listed subscriptions)"
 $credLines += "# Azure SP Graph: Application.ReadWrite.OwnedBy (self-scoped) + owner of its own"
 $credLines += "#                 app registration (R-619 self-rotating certificate)."
-$credLines += "# M365 permissions (application/Role):"
-$requiredGraphPermissions | ForEach-Object { $credLines += "#   - $_" }
-$credLines += "#   - Exchange.ManageAsApp (Office 365 Exchange Online)"
-$credLines += "#   - Sites.FullControl.All (SharePoint Online — R-613 PnP / Get-PnPTenant)"
-$credLines += "#   - Tenant.Read.All (Power BI Service — CIS Section 9)"
-$credLines += "#   - Directory role: Global Reader"
-$credLines += "#   - Power Platform management app registration (BAP — R-613 SCUBA-PP / MT.109x)"
-$credLines += "# MANUAL STEP STILL REQUIRED for Power BI / Microsoft Fabric checks (CIS Section 9):"
-$credLines += "#   the 'Tenant.Read.All' app role above is granted, but a Power BI/Fabric Service Admin"
-$credLines += "#   must ALSO enable 'Service principals can use read-only Power BI admin APIs' in the"
-$credLines += "#   Power BI admin portal (Tenant settings). Without it the Admin API returns 401."
-$credLines += "# POWER PLATFORM (R-613 SCUBA-PP / MT.109x): the script registers this app as a Power"
-$credLines += "#   Platform management app via the BAP REST API, which requires the person RUNNING this"
-$credLines += "#   script to be a Power Platform Administrator / Global Administrator. If that step warned"
-$credLines += "#   above, register it manually in Windows PowerShell 5.1 as a PP admin:"
-$credLines += "#     New-PowerAppManagementApp -ApplicationId $m365AppId"
-$credLines += "#   Without it the BAP admin API returns 403 and PP checks stay ManualReview."
-$credLines += "# NOTE: ALL client secrets below (Azure, M365$(if ($IncludeDefenderCspm) { ', Defender' })) are bootstrap-only"
+if ($AzureOnly) {
+    $credLines += "# M365 permissions: NONE — onboarded with -AzureOnly."
+    $credLines += "#   No Graph application permission, no Exchange.ManageAsApp, no Sites.FullControl.All,"
+    $credLines += "#   no Power BI Tenant.Read.All, no Global Reader directory role, and no Power Platform"
+    $credLines += "#   management-app registration was requested or granted. The only permission this"
+    $credLines += "#   onboarding holds outside Azure RBAC is the self-scoped Application.ReadWrite.OwnedBy"
+    $credLines += "#   above, which manages this principal's own certificate and nothing else."
+} else {
+    $credLines += "# M365 permissions (application/Role):"
+    $requiredGraphPermissions | ForEach-Object { $credLines += "#   - $_" }
+    $credLines += "#   - Exchange.ManageAsApp (Office 365 Exchange Online)"
+    $credLines += "#   - Sites.FullControl.All (SharePoint Online — R-613 PnP / Get-PnPTenant)"
+    $credLines += "#   - Tenant.Read.All (Power BI Service — CIS Section 9)"
+    $credLines += "#   - Directory role: Global Reader"
+    $credLines += "#   - Power Platform management app registration (BAP — R-613 SCUBA-PP / MT.109x)"
+    $credLines += "# MANUAL STEP STILL REQUIRED for Power BI / Microsoft Fabric checks (CIS Section 9):"
+    $credLines += "#   the 'Tenant.Read.All' app role above is granted, but a Power BI/Fabric Service Admin"
+    $credLines += "#   must ALSO enable 'Service principals can use read-only Power BI admin APIs' in the"
+    $credLines += "#   Power BI admin portal (Tenant settings). Without it the Admin API returns 401."
+    $credLines += "# POWER PLATFORM (R-613 SCUBA-PP / MT.109x): the script registers this app as a Power"
+    $credLines += "#   Platform management app via the BAP REST API, which requires the person RUNNING this"
+    $credLines += "#   script to be a Power Platform Administrator / Global Administrator. If that step warned"
+    $credLines += "#   above, register it manually in Windows PowerShell 5.1 as a PP admin:"
+    $credLines += "#     New-PowerAppManagementApp -ApplicationId $m365AppId"
+    $credLines += "#   Without it the BAP admin API returns 403 and PP checks stay ManualReview."
+}
+$credLines += "# NOTE: ALL client secrets below (Azure$(if (-not $AzureOnly) { ', M365' })$(if ($IncludeDefenderCspm) { ', Defender' })) are bootstrap-only"
 $credLines += "#       ($bootstrapSecretDays-day expiry) and are discarded by PAA after it provisions a"
 $credLines += "#       self-rotating certificate on each service principal."
 
@@ -1016,14 +1298,18 @@ $credLines += "#  NEXT STEPS"
 $credLines += "# ============================================================"
 $credLines += "# 1. Open PAA app and go to Settings > Integrations"
 $credLines += "# 2. Enter Azure credentials (AZURE_CLIENT_ID, AZURE_CLIENT_SECRET, AZURE_TENANT_ID)"
-$credLines += "# 3. Enter M365 credentials (M365_CLIENT_ID, M365_CLIENT_SECRET, M365_TENANT_ID)"
-$credLines += "#    (Power BI / Fabric checks) the 'Tenant.Read.All' app role is already granted;"
-$credLines += "#    enable 'service principals can use read-only Power BI admin APIs' in the Power BI"
-$credLines += "#    admin portal to activate CIS Section 9 — see PERMISSIONS GRANTED above."
+if ($AzureOnly) {
+    $credLines += "# 3. Leave the Microsoft 365 section empty — this tenant is Azure-only."
+} else {
+    $credLines += "# 3. Enter M365 credentials (M365_CLIENT_ID, M365_CLIENT_SECRET, M365_TENANT_ID)"
+    $credLines += "#    (Power BI / Fabric checks) the 'Tenant.Read.All' app role is already granted;"
+    $credLines += "#    enable 'service principals can use read-only Power BI admin APIs' in the Power BI"
+    $credLines += "#    admin portal to activate CIS Section 9 — see PERMISSIONS GRANTED above."
+}
 
 if ($consentFailures.Count -gt 0) {
-    $credLines += "# 4. REQUIRED: Grant admin consent for M365 permissions in the Azure portal:"
-    $credLines += "#    https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$m365AppId/isMSAApp/"
+    $credLines += "# 4. REQUIRED: Grant admin consent in the Azure portal:"
+    $credLines += "#    https://portal.azure.com/#blade/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/CallAnAPI/appId/$(if ($AzureOnly) { $azAppId } else { $m365AppId })/isMSAApp/"
 }
 
 $credLines += "# 5. DELETE THIS FILE: Remove-Item '$outputFileName'"
@@ -1042,10 +1328,16 @@ Write-Host "    Client ID (App ID)   : $azAppId"
 Write-Host "    Client Secret        : $(Get-MaskedSecret $azSecretText)"
 Write-Host "    Subscriptions        : $subscriptionIdList"
 Write-Host ""
-Write-Host "  M365 Graph App Registration" -ForegroundColor Cyan
-Write-Host "    Name                 : $m365AppName"
-Write-Host "    Client ID (App ID)   : $m365AppId"
-Write-Host "    Client Secret        : $(Get-MaskedSecret $m365SecretText)"
+if ($AzureOnly) {
+    Write-Host "  Microsoft 365          : not onboarded (-AzureOnly)" -ForegroundColor Cyan
+    Write-Host "    No app registration, no Graph permission, no Global Reader." -ForegroundColor Gray
+    Write-Host "    M365 / Entra ID / Zero Trust checks will report as not evaluated." -ForegroundColor Gray
+} else {
+    Write-Host "  M365 Graph App Registration" -ForegroundColor Cyan
+    Write-Host "    Name                 : $m365AppName"
+    Write-Host "    Client ID (App ID)   : $m365AppId"
+    Write-Host "    Client Secret        : $(Get-MaskedSecret $m365SecretText)"
+}
 
 if ($logAnalyticsWorkspaceId) {
     Write-Host ""
