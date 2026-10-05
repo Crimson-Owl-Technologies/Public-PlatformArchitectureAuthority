@@ -50,8 +50,21 @@
     scan opts IN to M365, this script opts OUT, so that the existing default behaviour of hosted
     onboarding is unchanged.
 
+.PARAMETER UseDeviceCode
+    Sign in with a device code instead of an interactive browser window, for both the Azure and the
+    Microsoft Graph connection.
+
+    REQUIRED on a headless host — Linux, WSL or a container — where the default interactive flow has
+    no browser to open. Without it on such a host, Connect-MgGraph returns WITHOUT raising an error
+    and leaves no session, and the first Graph call then fails with "Authentication needed. Please
+    call Connect-MgGraph." (R-1347.)
+
 .EXAMPLE
     .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+.EXAMPLE
+    # On Linux, WSL or a container — sign in with a device code instead of a browser window:
+    .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -UseDeviceCode
 
 .EXAMPLE
     # Azure only — no Microsoft 365, Entra ID, SharePoint, Exchange or Power Platform access:
@@ -95,7 +108,14 @@ param (
     # permissions (e.g. R-613 SharePoint Sites.FullControl.All, the Power Platform management-app
     # registration, Global Reader) to tenants onboarded before those were part of the script.
     [Parameter(Mandatory = $false)]
-    [switch]$PermissionsOnly
+    [switch]$PermissionsOnly,
+
+    # R-1347. Sign in with a device code instead of an interactive browser window. REQUIRED on a
+    # headless host — Linux, WSL or a container — where the default interactive flow has no browser
+    # to open. Without it, Connect-MgGraph on such a host returns WITHOUT throwing and leaves no
+    # session, and every later Graph call fails with "Authentication needed".
+    [Parameter(Mandatory = $false)]
+    [switch]$UseDeviceCode
 )
 
 Set-StrictMode -Version Latest
@@ -393,7 +413,29 @@ Write-Success "  All required modules found: $($requiredModules -join ', ')"
 Write-Step "[2/5] Creating Azure service principal..."
 
 Write-Host "  Connecting to Azure (tenant: $TenantId)..." -ForegroundColor Cyan
-Connect-AzAccount -TenantId $TenantId | Out-Null
+# R-1347. Same unchecked pattern as the Graph connect below used to have: verify the context exists
+# rather than trusting that the call returned. This one happened to succeed on the headless host that
+# exposed the Graph failure, which makes it a latent version of the same defect, not a safe one.
+$azConnect = @{ TenantId = $TenantId }
+if ($UseDeviceCode) { $azConnect['UseDeviceAuthentication'] = $true }
+try {
+    Connect-AzAccount @azConnect | Out-Null
+}
+catch {
+    Write-Host "ERROR: Not signed in to Azure - the connection did not complete." -ForegroundColor Red
+    Write-Host "       On a headless host (Linux, WSL or a container) re-run with -UseDeviceCode." -ForegroundColor Yellow
+    Write-Host "       This is not a problem with your tenant." -ForegroundColor Yellow
+    Write-Host "       Underlying error: $($_.Exception.Message)" -ForegroundColor DarkGray
+    exit 1
+}
+$azContext = Get-AzContext
+if (-not $azContext -or -not $azContext.Account) {
+    Write-Host "ERROR: Not signed in to Azure - the connection did not complete." -ForegroundColor Red
+    Write-Host "       On a headless host (Linux, WSL or a container) re-run with -UseDeviceCode." -ForegroundColor Yellow
+    Write-Host "       This is not a problem with your tenant." -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "    Signed in as $($azContext.Account) (tenant $($azContext.Tenant.Id))." -ForegroundColor Gray
 
 # Discover subscriptions
 if ($SubscriptionIds -and $SubscriptionIds.Count -gt 0) {
@@ -546,15 +588,47 @@ Write-Host "  Connecting to Microsoft Graph (tenant: $TenantId)..." -ForegroundC
 # is not requested — the operator's consent prompt is narrowed to match what the run actually does.
 $graphConnectScopes = @('Application.ReadWrite.All', 'AppRoleAssignment.ReadWrite.All')
 if (-not $AzureOnly) { $graphConnectScopes += 'RoleManagement.ReadWrite.Directory' }
-Connect-MgGraph -TenantId $TenantId -Scopes $graphConnectScopes | Out-Null
+
+# R-1347. Connect-MgGraph can return WITHOUT THROWING and leave no session — observed on a headless
+# Linux host, where the default interactive flow has no browser to open. $ErrorActionPreference is
+# 'Stop' and it still did not stop, so the only reliable check is to ask for the context afterwards.
+$mgConnect = @{ TenantId = $TenantId; Scopes = $graphConnectScopes }
+if ($UseDeviceCode) { $mgConnect['UseDeviceCode'] = $true }
+try {
+    Connect-MgGraph @mgConnect | Out-Null
+}
+catch {
+    Write-Host "ERROR: Not signed in to Microsoft Graph - the connection did not complete, so the directory could not be read." -ForegroundColor Red
+    Write-Host "       On a headless host (Linux, WSL or a container) re-run with -UseDeviceCode." -ForegroundColor Yellow
+    Write-Host "       This is not a problem with your tenant." -ForegroundColor Yellow
+    Write-Host "       Underlying error: $($_.Exception.Message)" -ForegroundColor DarkGray
+    exit 1
+}
+
+# Verify the session EXISTS rather than trusting that the call returned. This is the check whose
+# absence turned an authentication failure into "the Microsoft Graph service principal is missing
+# from your tenant" — a claim that cannot be true of any tenant, and which sent the reader looking
+# for a directory defect instead of signing in.
+$mgContext = Get-MgContext
+if (-not $mgContext -or -not $mgContext.Account) {
+    Write-Host "ERROR: Not signed in to Microsoft Graph - the connection did not complete, so the directory could not be read." -ForegroundColor Red
+    Write-Host "       On a headless host (Linux, WSL or a container) re-run with -UseDeviceCode." -ForegroundColor Yellow
+    Write-Host "       This is not a problem with your tenant." -ForegroundColor Yellow
+    exit 1
+}
+Write-Host "    Signed in as $($mgContext.Account) (tenant $($mgContext.TenantId))." -ForegroundColor Gray
 
 Write-Host "  Resolving Microsoft Graph service principal and permission IDs..." -ForegroundColor Cyan
 
 # I3 — Filter by well-known AppId (stable, not display name)
+# R-1347: reached ONLY with a verified session, so a null result here really does mean the object is
+# absent from the directory — which is what the message below is allowed to say, and could not say
+# honestly before the check above existed.
 $graphServicePrincipal = Get-MgServicePrincipal -Filter "appId eq '00000003-0000-0000-c000-000000000000'" |
     Select-Object -First 1
 if (-not $graphServicePrincipal) {
-    Write-Host "ERROR: Could not find Microsoft Graph service principal in tenant." -ForegroundColor Red
+    Write-Host "ERROR: Signed in to tenant $($mgContext.TenantId), but the Microsoft Graph service principal was not found in it." -ForegroundColor Red
+    Write-Host "       This is unusual - every tenant normally has it. Authentication is NOT the problem here." -ForegroundColor Yellow
     exit 1
 }
 
