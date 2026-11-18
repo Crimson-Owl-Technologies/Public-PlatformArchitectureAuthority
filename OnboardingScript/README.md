@@ -8,7 +8,7 @@ Automates the PAA tenant onboarding that would otherwise require several manual 
 - an **M365 (Microsoft Graph) app registration** with the application permissions PAA needs,
 - and, optionally, a **Defender CSPM service principal** and a Log Analytics workspace reference.
 
-Each principal is created with a short-lived **bootstrap secret only** (30-day expiry). After you connect it, PAA provisions a **self-rotating certificate** in its own Key Vault and discards the bootstrap secret — so there is no long-lived credential to manage or rotate (R-618 / R-619). At the end the script writes the bootstrap credentials to a locked `.txt` file in the same folder, ready to paste into PAA.
+Each principal is created with a short-lived **bootstrap secret only** (30-day expiry). After you connect it, PAA provisions a **self-rotating certificate** in its own Key Vault and discards the bootstrap secret — so there is no long-lived credential to manage or rotate. At the end the script writes the bootstrap credentials to a locked `.txt` file in the same folder, ready to paste into PAA.
 
 > **If Microsoft 365 is out of scope**, pass `-AzureOnly`. No M365 app registration is created and no Graph, Exchange, SharePoint, Power BI, Global Reader or Power Platform permission is requested. See [Azure-only onboarding](#azure-only-onboarding--azureonly) — read it before running against a customer whose security review restricted the scope.
 
@@ -55,7 +55,7 @@ Install-Module -Name Az.Accounts, Az.Resources, Microsoft.Graph -Scope CurrentUs
     -IncludeLogAnalytics
 ```
 
-**With Log Analytics workspace and Entra Graph activity log stream (R-671 app-permission right-sizing):**
+**With Log Analytics workspace and Entra Graph activity log stream (app-permission right-sizing):**
 
 ```powershell
 .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" `
@@ -78,7 +78,7 @@ Install-Module -Name Az.Accounts, Az.Resources, Microsoft.Graph -Scope CurrentUs
 .\Setup-PaaOnboarding.ps1 -TenantId "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -PermissionsOnly
 ```
 
-Use `-PermissionsOnly` to grant **newly-added** permissions to a tenant that was **already onboarded** — for example after the SharePoint `Sites.FullControl.All`, Power BI `Tenant.Read.All`, Global Reader, or the Power Platform management-app registration were added to the script (R-613). It:
+Use `-PermissionsOnly` to grant **newly-added** permissions to a tenant that was **already onboarded** — for example after the SharePoint `Sites.FullControl.All`, Power BI `Tenant.Read.All`, Global Reader, or the Power Platform management-app registration were added to the script. It:
 
 - **requires the existing** `PAA-Azure-…` and `PAA-M365-…` principals (errors instead of creating them),
 - re-applies **all** Azure roles, Graph/Exchange/SharePoint/Power BI app-role consents, the Global Reader directory role, and the Power Platform management-app registration (every grant is idempotent),
@@ -110,22 +110,22 @@ Named `PAA-M365-<first 8 chars of tenant ID>`, with the following Graph **applic
 - `AuditLog.Read.All` — sign-in activity on guest users
 - `Reports.Read.All` — assigned-but-inactive M365 licence detection (optional; degrades gracefully if absent)
 - `DeviceManagementManagedDevices.Read.All`, `DeviceManagementConfiguration.Read.All`, `DeviceManagementApps.Read.All` — Intune device compliance, configuration, and app-protection
-- `DeviceManagementServiceConfig.Read.All` — enrollment restrictions, mobile-threat-defence connectors, Autopilot profiles (R-753)
-- `DeviceManagementRBAC.Read.All` — Intune operation-approval policies (R-753)
-- `OnPremDirectorySynchronization.Read.All` — Entra Connect sync configuration and state (R-753)
+- `DeviceManagementServiceConfig.Read.All` — enrollment restrictions, mobile-threat-defence connectors, Autopilot profiles
+- `DeviceManagementRBAC.Read.All` — Intune operation-approval policies
+- `OnPremDirectorySynchronization.Read.All` — Entra Connect sync configuration and state
 - `SecurityEvents.Read.All` — Defender alerts, Secure Score, and Defender for Office 365 policies
 - `SecurityIncident.Read.All` — Defender incidents
 - `SharePointTenantSettings.Read.All` — SharePoint / OneDrive admin settings
-- `NetworkAccess.Read.All` — Global Secure Access / Entra Network configuration (R-636); degrades gracefully if absent or unlicensed
+- `NetworkAccess.Read.All` — Global Secure Access / Entra Network configuration; degrades gracefully if absent or unlicensed
 - `Application.ReadWrite.OwnedBy` — self-scoped certificate bootstrap/rotation (this app only)
 
 Plus:
 
 - **`Exchange.ManageAsApp`** (Office 365 Exchange Online app role) — Exchange Online configuration collection
-- **`Sites.FullControl.All`** (SharePoint Online app role) — SharePoint/OneDrive deep config (R-613 PnP)
+- **`Sites.FullControl.All`** (SharePoint Online app role) — SharePoint/OneDrive deep config (PnP)
 - **`Tenant.Read.All`** (Power BI Service app role) — CIS Section 9 (also needs the manual portal toggle below)
 - **Global Reader** directory role — read-only access to admin surfaces collected via PowerShell
-- **Power Platform management application** (BAP registration) — Power Platform tenant settings + DLP (R-613 SCUBA-PP / MT.109x)
+- **Power Platform management application** (BAP registration) — Power Platform tenant settings + DLP (SCUBA-PP / MT.109x)
 
 ### Power Platform — registration requires a Power Platform Admin running this script
 The Power Platform checks (SCUBA-PP-1.1/1.2/2.1/4.1, MT.1099/1100/1101) read tenant settings + DLP policies from the BAP admin REST API. The script registers the M365 app as a **Power Platform management application** (the REST equivalent of `New-PowerAppManagementApp`, since that cmdlet is Windows-PowerShell-5.1-only). This call needs a **signed-in admin user** who holds **Power Platform Administrator / Global Administrator** (`ManageAdminApplications`) — i.e. whoever runs this script. If it warns, register manually in **Windows PowerShell 5.1** as a PP admin: `New-PowerAppManagementApp -ApplicationId <M365_CLIENT_ID>`. Without it the BAP API returns 403 and the PP checks stay ManualReview (safe).
@@ -149,7 +149,7 @@ One workspace serves both features:
 | Table | Feature |
 |-------|---------|
 | `AzureActivity` | IAM Usage Visualizer |
-| `MicrosoftGraphActivityLogs` | R-671 App-Permission Right-Sizing |
+| `MicrosoftGraphActivityLogs` | App-Permission Right-Sizing |
 
 #### `-EnableGraphActivityLogs` — Entra Graph activity log stream
 
@@ -157,7 +157,7 @@ Add `-EnableGraphActivityLogs` (together with `-IncludeLogAnalytics`) to also cr
 
 - **Requires Entra ID P1 or P2 licence** — the category is rejected by the Entra service without it.
 - **Incurs Log Analytics ingestion cost** — it streams ALL tenant Graph API traffic continuously.
-- **Forward-only** — there is no backfill. Data starts accumulating from the moment the setting is created. Allow **30-90 days** before the R-671 app-permission right-sizing recommendations become meaningful.
+- **Forward-only** — there is no backfill. Data starts accumulating from the moment the setting is created. Allow **30-90 days** before the app-permission right-sizing recommendations become meaningful.
 
 The setting uses the stable name `PAA-GraphActivityLogs`, so re-running the script with `-EnableGraphActivityLogs` is idempotent (it updates rather than duplicates).
 
