@@ -229,6 +229,16 @@ $requiredGraphPermissions = @(
     'SecurityIncident.Read.All',             # Defender incidents (CollectIncidentSummaryAsync)
     'SharePointTenantSettings.Read.All',     # SharePoint / OneDrive admin settings
     'NetworkAccess.Read.All',                # Global Secure Access / Entra Network config (config-only); degrades gracefully if absent / unlicensed
+    'OrgSettings-Forms.Read.All',            # Microsoft Forms phishing-protection setting
+    'DirectoryRecommendations.Read.All',     # Microsoft Entra recommendations
+    'SecurityIdentitiesHealth.Read.All',     # Defender for Identity health issues
+    'SecurityIdentitiesSensors.Read.All',    # Defender for Identity sensors
+    'ThreatHunting.Read.All',                # Defender advanced hunting queries (exposure graph, Cloud Apps activity, device onboarding)
+    'UserAuthenticationMethod.Read.All',     # authentication methods registered by privileged and break-glass accounts
+    'AuthenticationContext.Read.All',        # Conditional Access authentication contexts
+    'SensitivityLabels.Read.All',            # the tenant's sensitivity labels
+    'AttackSimulation.Read.All',             # attack simulation training campaigns
+    'IdentityRiskEvent.Read.All',            # risk detections on service principals
     'Application.ReadWrite.OwnedBy'          # self-scoped cert bootstrap/rotation (this app only)
 )
 
@@ -1821,7 +1831,7 @@ if (-not $AzureOnly) {
                     -ErrorAction Stop | Out-Null
                 Write-Host "    Consented: $permName" -ForegroundColor Gray
             } catch {
-                if ($certMode -and (Test-PaaAlreadyAssigned $_)) {
+                if (Test-PaaAlreadyAssigned $_) {
                     Write-Warn "  [M365] '$permName' role already assigned (re-run); skipping."
                 } else {
                     $consentFailures += $permName
@@ -1840,7 +1850,7 @@ if (-not $AzureOnly) {
                     -ErrorAction Stop | Out-Null
                 Write-Host "    Consented: $exchangeAppRole" -ForegroundColor Gray
             } catch {
-                if ($certMode -and (Test-PaaAlreadyAssigned $_)) {
+                if (Test-PaaAlreadyAssigned $_) {
                     Write-Warn "  [M365] '$exchangeAppRole' role already assigned (re-run); skipping."
                 } else {
                     $consentFailures += $exchangeAppRole
@@ -1859,7 +1869,7 @@ if (-not $AzureOnly) {
                     -ErrorAction Stop | Out-Null
                 Write-Host "    Consented: $sharePointAppRole (SharePoint)" -ForegroundColor Gray
             } catch {
-                if ($certMode -and (Test-PaaAlreadyAssigned $_)) {
+                if (Test-PaaAlreadyAssigned $_) {
                     Write-Warn "  [M365] '$sharePointAppRole' role already assigned (re-run); skipping."
                 } else {
                     $consentFailures += $sharePointAppRole
@@ -1878,7 +1888,7 @@ if (-not $AzureOnly) {
                     -ErrorAction Stop | Out-Null
                 Write-Host "    Consented: $powerBiAppRole (Power BI)" -ForegroundColor Gray
             } catch {
-                if ($certMode -and (Test-PaaAlreadyAssigned $_)) {
+                if (Test-PaaAlreadyAssigned $_) {
                     Write-Warn "  [M365] '$powerBiAppRole' role already assigned (re-run); skipping."
                 } else {
                     $consentFailures += $powerBiAppRole
